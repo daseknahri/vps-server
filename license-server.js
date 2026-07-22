@@ -23,17 +23,40 @@ const ks = require('./keystore');
 // is missing: a server that will not start is loudly broken and gets noticed during deploy, whereas one that quietly
 // serves unsigned grants would look healthy while every customer drifted into lockout as their grace ran out.
 // Never auto-generate — the public half is compiled into shipped clients, so the pair must be fixed and deliberate.
+const PEM_RE = /BEGIN (PRIVATE|ED25519 PRIVATE) KEY/;
 function loadSigningKey() {
-  const b64 = String(process.env.LICENSE_SIGNING_KEY || '').trim();
-  let pem = null;
-  if (b64) { try { pem = Buffer.from(b64, 'base64').toString('utf8'); } catch { pem = null; } }
-  if (!pem) { const f = path.join(__dirname, 'signing-key.pem'); if (fs.existsSync(f)) pem = fs.readFileSync(f, 'utf8'); }
-  if (!pem || !/BEGIN (PRIVATE|ED25519 PRIVATE) KEY/.test(pem)) {
-    console.error('\nFATAL: no licence signing key.\n  Set LICENSE_SIGNING_KEY (base64 of the PKCS8 PEM) or place signing-key.pem beside this file.\n  Generate a pair with:  node gen-signing-key.js\n  The PUBLIC half must match LICENSE_PUBKEY compiled into the client, or nobody can activate.\n');
+  const raw = String(process.env.LICENSE_SIGNING_KEY || '').trim();
+  let pem = null, how = '';
+  if (raw) {
+    // Accept the key HOWEVER it was pasted. Coolify's env editor is a single-line field, so the same key arrives
+    // base64-encoded (what gen-signing-key.js prints), pasted raw with real newlines, or flattened with literal
+    // \n sequences. All three are the identical key — rejecting two of them just burns deploy cycles.
+    if (PEM_RE.test(raw)) { pem = raw.replace(/\\n/g, '\n'); how = 'LICENSE_SIGNING_KEY (raw PEM)'; }
+    else {
+      try { const d = Buffer.from(raw, 'base64').toString('utf8'); if (PEM_RE.test(d)) { pem = d; how = 'LICENSE_SIGNING_KEY (base64)'; } } catch {}
+    }
+  }
+  if (!pem) { const f = path.join(__dirname, 'signing-key.pem'); if (fs.existsSync(f)) { pem = fs.readFileSync(f, 'utf8'); how = 'signing-key.pem beside the server'; } }
+  if (!pem) {
+    // Name WHICH failure this is. "Variable absent" and "variable set but not a key" look identical from outside
+    // the container and have completely different fixes; guessing wrong costs a full redeploy each time.
+    console.error('\nFATAL: no licence signing key.');
+    console.error(raw
+      ? `  LICENSE_SIGNING_KEY is SET (${raw.length} chars) but is neither base64-of-a-PEM nor a PEM itself.\n` +
+        '  Most likely truncated on paste, or the wrong value was copied. Expect ~160 chars of base64 for an\n' +
+        '  Ed25519 PKCS8 key, or a full -----BEGIN PRIVATE KEY----- block.'
+      : '  LICENSE_SIGNING_KEY is EMPTY or absent from this container.\n' +
+        '  In Coolify: set it on THIS resource as a RUNTIME variable (a build-only variable never reaches the\n' +
+        '  running process), Save, then Redeploy — restarting alone does not re-read the environment.');
+    console.error('  Generate a pair with:  node gen-signing-key.js');
+    console.error('  The PUBLIC half must match LICENSE_PUBKEY compiled into the client, or nobody can activate.\n');
     process.exit(1);
   }
-  try { return crypto.createPrivateKey(pem); }
-  catch (e) { console.error('\nFATAL: licence signing key is unreadable: ' + e.message + '\n'); process.exit(1); }
+  try {
+    const k = crypto.createPrivateKey(pem);
+    console.log('licence signing key loaded from ' + how);
+    return k;
+  } catch (e) { console.error('\nFATAL: licence signing key is unreadable: ' + e.message + '\n'); process.exit(1); }
 }
 const SIGNING_KEY = loadSigningKey();
 
