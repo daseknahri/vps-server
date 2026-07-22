@@ -14,15 +14,23 @@ var (Step 5). Customer keys are created later with `gen-key.js` on the server.
 
 ---
 
-## Step 1 — Repo
-The whole project lives at `github.com/daseknahri/za-post` (this `vps-server/` is a subfolder).
+## Step 1 — Repo  ⚠️ TWO COPIES OF THIS CODE EXIST
+Coolify deploys from the **standalone** repo `github.com/daseknahri/vps-server`, whose contents are this
+folder's files at its root. This `vps-server/` folder inside the app project is only a working copy.
+
+**Editing here deploys nothing.** Changes reach production only when copied into that other repo. This has
+already cost one cycle: the licence-signing server was written here and Coolify was redeployed, so it
+rebuilt the *old* code — the deploy looked perfectly healthy while the new server had never shipped, and
+`curl` could not tell the difference. After changing anything here, copy it across, redeploy, and confirm
+with `node scripts/verify-license-server.js <url> <key>` before shipping any client build.
+
 The real `keys.json` is gitignored, so no secret is published — but keep the repo **private**
 anyway, since it holds your sellable app source.
 
 ## Step 2 — New resource in Coolify
-- **+ New → Application → Private Repository** → pick `daseknahri/za-post`, branch `main`.
-- **Base Directory** = `/vps-server` ← important: tells Coolify to build from the subfolder.
-- **Build Pack: Dockerfile** (auto-detected at `vps-server/Dockerfile`). (Nixpacks also works via `package.json` + start script, but Dockerfile is the most predictable.)
+- **+ New → Application → Private Repository** → pick `daseknahri/vps-server`, branch `main`.
+- **Base Directory** = `/` (the repo root already *is* the server folder).
+- **Build Pack: Dockerfile** (auto-detected at the repo root). (Nixpacks also works via `package.json` + start script, but Dockerfile is the most predictable.)
 
 ## Step 3 — Port
 - Set **Ports Exposes = `3509`** (the app listens on `PORT`, default 3509; the Dockerfile sets it).
@@ -35,6 +43,10 @@ anyway, since it holds your sellable app source.
 - This makes `/data/keys.json` survive redeploys.
 
 ## Step 5 — Environment variables
+- **`LICENSE_SIGNING_KEY`** = base64 of the PKCS8 PEM private key (from `node gen-signing-key.js`).
+  **The server refuses to boot without it.** Clients from v1.0.253 on reject any grant that is not signed by
+  it, so an unsigned server activates nobody. Its public half is compiled into the client — replacing this
+  value locks out every already-shipped build, so set it once and never rotate it casually.
 - `OWNER_KEY` = your owner license key — seeded into the volume on first boot.
   (Kept in Coolify's env, not in Git, so the secret never gets published.)
 - `ADMIN_TOKEN` = a long secret (protects `GET /api/keys`).
@@ -49,13 +61,15 @@ anyway, since it holds your sellable app source.
 ## Step 7 — Deploy & verify
 Click **Deploy**. Then test (replace the URL with your domain/IP):
 ```bash
-# should return {"valid":true,"message":"Activated"} the first time (binds the test hwid)
+# Must return valid:true AND a "token" + "sig" pair. Without those two fields the server is running
+# unsigned, and every v1.0.253+ client will refuse it — check LICENSE_SIGNING_KEY before shipping.
 curl -X POST https://license.yourdomain.com/api/validate \
   -H "Content-Type: application/json" \
-  -d '{"license":"YOUR-OWNER-KEY","hwid":"test-machine-1"}'
+  -d '{"license":"YOUR-OWNER-KEY","hwid":"test-machine-1","nonce":"n1"}'
 
-# list keys (admin)
-curl "https://license.yourdomain.com/api/keys?admin=YOUR_ADMIN_TOKEN"
+# list keys (admin) — header only; the ?admin= query param was REMOVED (it leaked the token into
+# Nginx/Cloudflare access logs).
+curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" https://license.yourdomain.com/api/keys
 ```
 
 ## Step 8 — Point the desktop app at this server

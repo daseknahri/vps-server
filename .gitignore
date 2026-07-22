@@ -6,3 +6,8 @@ key-audit.log
 node_modules/
 *.log
 data/
+
+# Ed25519 licence-SIGNING private key — belongs only in the Coolify env var (LICENSE_SIGNING_KEY).
+# Whoever holds it can mint a valid licence for any machine.
+signing-key.pem
+*.pem
