@@ -24,8 +24,26 @@ const ks = require('./keystore');
 // serves unsigned grants would look healthy while every customer drifted into lockout as their grace ran out.
 // Never auto-generate — the public half is compiled into shipped clients, so the pair must be fixed and deliberate.
 const PEM_RE = /BEGIN (PRIVATE|ED25519 PRIVATE) KEY/;
+// Find the variable even if its NAME was typed slightly wrong. Coolify's env editor happily accepts a trailing
+// space, and this project's own prose spells it "licence" (British) while the variable is LICENSE_ (American) —
+// so LICENCE_SIGNING_KEY and "LICENSE_SIGNING_KEY " are the two mistakes practically begging to be made. Both
+// look identical to "variable absent" from inside the process, which is a brutal thing to debug through redeploys.
+function findSigningKeyVar() {
+  if (String(process.env.LICENSE_SIGNING_KEY || '').trim()) return { value: process.env.LICENSE_SIGNING_KEY.trim(), name: 'LICENSE_SIGNING_KEY' };
+  for (const k of Object.keys(process.env)) {
+    if (/^\s*licen[sc]e[_-]?signing[_-]?key\s*$/i.test(k) && String(process.env[k] || '').trim()) {
+      return { value: String(process.env[k]).trim(), name: k };
+    }
+  }
+  return { value: '', name: null };
+}
+
 function loadSigningKey() {
-  const raw = String(process.env.LICENSE_SIGNING_KEY || '').trim();
+  const found = findSigningKeyVar();
+  const raw = found.value;
+  if (found.name && found.name !== 'LICENSE_SIGNING_KEY') {
+    console.warn(`WARNING: using env var ${JSON.stringify(found.name)} — rename it to exactly LICENSE_SIGNING_KEY.`);
+  }
   let pem = null, how = '';
   if (raw) {
     // Accept the key HOWEVER it was pasted. Coolify's env editor is a single-line field, so the same key arrives
@@ -68,6 +86,14 @@ function loadSigningKey() {
         '  running process), Save, then Redeploy — restarting alone does not re-read the environment.\n' +
         '  If the variable still will not stick, sidestep the env editor entirely: put the PEM at\n' +
         '  /data/signing-key.pem on the persistent volume, or paste the key as HEX (no +, / or = to mangle).');
+    // Print what this PROCESS can actually see. Names are JSON-quoted so a trailing space or stray character is
+    // visible; values are never printed, only their length. Guessing at this from outside has cost several
+    // redeploy cycles, and the running process is the only witness that cannot be wrong.
+    const near = Object.keys(process.env).filter((k) => /lic|sign|key/i.test(k)).sort();
+    console.error('  Env vars this process can see matching lic/sign/key:');
+    console.error(near.length
+      ? near.map((k) => `    ${JSON.stringify(k)} = <${String(process.env[k] || '').length} chars>`).join('\n')
+      : '    (none — nothing resembling the variable reached this container at all)');
     console.error('  Generate a pair with:  node gen-signing-key.js');
     console.error('  The PUBLIC half must match LICENSE_PUBKEY compiled into the client, or nobody can activate.\n');
     process.exit(1);
