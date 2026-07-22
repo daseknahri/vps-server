@@ -30,13 +30,30 @@ function loadSigningKey() {
   if (raw) {
     // Accept the key HOWEVER it was pasted. Coolify's env editor is a single-line field, so the same key arrives
     // base64-encoded (what gen-signing-key.js prints), pasted raw with real newlines, or flattened with literal
-    // \n sequences. All three are the identical key — rejecting two of them just burns deploy cycles.
-    if (PEM_RE.test(raw)) { pem = raw.replace(/\\n/g, '\n'); how = 'LICENSE_SIGNING_KEY (raw PEM)'; }
-    else {
-      try { const d = Buffer.from(raw, 'base64').toString('utf8'); if (PEM_RE.test(d)) { pem = d; how = 'LICENSE_SIGNING_KEY (base64)'; } } catch {}
+    // \n sequences. All are the identical key — rejecting some of them just burns deploy cycles.
+    // HEX is offered too because it is the only encoding with no +, / or = in it: base64 padding has a habit of
+    // being mangled or dropped by env-var editors and .env parsers, and that failure is invisible from outside.
+    const tries = [
+      ['raw PEM', () => (PEM_RE.test(raw) ? raw.replace(/\\n/g, '\n') : null)],
+      ['base64', () => Buffer.from(raw, 'base64').toString('utf8')],
+      ['hex', () => (/^[0-9a-fA-F]+$/.test(raw) && raw.length % 2 === 0 ? Buffer.from(raw, 'hex').toString('utf8') : null)],
+    ];
+    for (const [label, decode] of tries) {
+      try { const d = decode(); if (d && PEM_RE.test(d)) { pem = d; how = `LICENSE_SIGNING_KEY (${label})`; break; } } catch {}
     }
   }
-  if (!pem) { const f = path.join(__dirname, 'signing-key.pem'); if (fs.existsSync(f)) { pem = fs.readFileSync(f, 'utf8'); how = 'signing-key.pem beside the server'; } }
+  // File fallbacks, in case the environment itself is the problem. /data is the persistent volume this server
+  // already mounts for keys.json, so a key placed there survives redeploys without going near an env editor.
+  if (!pem) {
+    const candidates = [
+      [String(process.env.LICENSE_SIGNING_KEY_FILE || '').trim(), 'LICENSE_SIGNING_KEY_FILE'],
+      ['/data/signing-key.pem', '/data/signing-key.pem (persistent volume)'],
+      [path.join(__dirname, 'signing-key.pem'), 'signing-key.pem beside the server'],
+    ];
+    for (const [f, label] of candidates) {
+      try { if (f && fs.existsSync(f)) { const t = fs.readFileSync(f, 'utf8'); if (PEM_RE.test(t)) { pem = t; how = label; break; } } } catch {}
+    }
+  }
   if (!pem) {
     // Name WHICH failure this is. "Variable absent" and "variable set but not a key" look identical from outside
     // the container and have completely different fixes; guessing wrong costs a full redeploy each time.
@@ -45,9 +62,12 @@ function loadSigningKey() {
       ? `  LICENSE_SIGNING_KEY is SET (${raw.length} chars) but is neither base64-of-a-PEM nor a PEM itself.\n` +
         '  Most likely truncated on paste, or the wrong value was copied. Expect ~160 chars of base64 for an\n' +
         '  Ed25519 PKCS8 key, or a full -----BEGIN PRIVATE KEY----- block.'
-      : '  LICENSE_SIGNING_KEY is EMPTY or absent from this container.\n' +
+      : '  LICENSE_SIGNING_KEY is EMPTY or absent from this container, and no key file was found at\n' +
+        '  LICENSE_SIGNING_KEY_FILE, /data/signing-key.pem, or beside this server.\n' +
         '  In Coolify: set it on THIS resource as a RUNTIME variable (a build-only variable never reaches the\n' +
-        '  running process), Save, then Redeploy — restarting alone does not re-read the environment.');
+        '  running process), Save, then Redeploy — restarting alone does not re-read the environment.\n' +
+        '  If the variable still will not stick, sidestep the env editor entirely: put the PEM at\n' +
+        '  /data/signing-key.pem on the persistent volume, or paste the key as HEX (no +, / or = to mangle).');
     console.error('  Generate a pair with:  node gen-signing-key.js');
     console.error('  The PUBLIC half must match LICENSE_PUBKEY compiled into the client, or nobody can activate.\n');
     process.exit(1);
