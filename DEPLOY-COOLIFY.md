@@ -52,6 +52,15 @@ anyway, since it holds your sellable app source.
 - `ADMIN_TOKEN` = a long secret (protects `GET /api/keys`).
 - `KEYS_PATH` = `/data/keys.json` (already set by the Dockerfile; add it here too if using Nixpacks).
 - (Optional) `PORT` = `3509`.
+- **Click tracking (optional — the desktop app's per-group / per-account link clicks):**
+  - `CLICK_DEST` = the offer URL that `/r` redirects clicks to. **Must equal the destination link that's in your posts** —
+    the app matches that URL to know what to swap for the tracked link. Server-side (not a query param) so `/r` can never be
+    abused as an open redirect.
+  - `CLICK_TOKEN` = a random secret. The desktop app sends it as `Authorization: Bearer <CLICK_TOKEN>` to read `GET /api/clicks`.
+    Keep it SEPARATE from `ADMIN_TOKEN` (least privilege — the app never needs key-store access).
+  - `CLICKS_PATH` = `/data/clicks.jsonl` is the default (already on the persistent volume — survives redeploys). Set it only to relocate.
+  - ⚠️ Click tracking adds a **new file** `clicks.js` and two routes in `license-server.js`. Per Step 1, both must be copied
+    into the `daseknahri/vps-server` deploy repo — editing this working copy ships nothing.
 
 ## Step 6 — Domain + HTTPS
 - Coolify gives a domain (or set your own subdomain, e.g. `license.yourdomain.com`) and issues
@@ -71,6 +80,19 @@ curl -X POST https://license.yourdomain.com/api/validate \
 # Nginx/Cloudflare access logs).
 curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" https://license.yourdomain.com/api/keys
 ```
+
+**Click tracking (if you set `CLICK_DEST` / `CLICK_TOKEN`):**
+```bash
+# The redirect — must return HTTP 302 with Location: <your CLICK_DEST>. A real browser hitting this URL is
+# logged as a click; Facebook's link-preview crawler (facebookexternalhit) is filtered out and NOT counted.
+curl -sI "https://license.yourdomain.com/r?g=test&a=test"
+
+# The counts the desktop app reads — Bearer header only. Returns { total, byGroup, byAccount, byGroupAccount }.
+curl -s -H "Authorization: Bearer YOUR_CLICK_TOKEN" https://license.yourdomain.com/api/clicks
+```
+Then in the app: **Groups tab → Click tracking → Local**, set Destination (= `CLICK_DEST`), Redirect base
+(`https://license.yourdomain.com/r`), Clicks API (`https://license.yourdomain.com/api/clicks`) and the token, and hit
+**Refresh clicks**. Every posted link carries `&a=<account>`, so `byAccount` populates automatically for per-account stats.
 
 ## Step 8 — Point the desktop app at this server
 Two ways:

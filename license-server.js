@@ -162,6 +162,39 @@ try {
 
 app.get('/health', (_req, res) => res.status(200).json({ ok: true }));
 
+// ── CLICK TRACKING (per-group / per-account) ─────────────────────────────────────────────────────────────────────────
+// The desktop app posts links like  https://<this-host>/r?g=<groupId>&a=<account>&p=<postId>  into Facebook groups.
+// A real click here is LOGGED (to /data/clicks.jsonl, persistent) then 302-redirected to CLICK_DEST — the ONE shared
+// offer URL, configured server-side so /r can never be abused as an open redirect. The app reads /api/clicks to show
+// per-group AND per-account totals. Isolated from licence validation: /r is public + wrapped so it can never throw, and
+// /api/clicks uses its OWN token (CLICK_TOKEN, least-privilege — NOT the admin token).
+const clicks = require('./clicks');
+const CLICK_DEST = String(process.env.CLICK_DEST || '').trim();
+const CLICK_TOKEN = String(process.env.CLICK_TOKEN || '').trim();
+// Social/link-preview crawlers pre-fetch every posted link (Facebook fetches it once to build the preview card). Those are
+// NOT human clicks — filter them out of the count so the preview fetch doesn't inflate every group by one. Real users in
+// Facebook's in-app browser send FBAN/FBAV (NOT matched here), so their clicks are still counted.
+const CLICK_BOT_RE = /bot|crawl|spider|facebookexternalhit|facebot|linkpreview|preview|slurp|bingpreview|whatsapp|telegram|discord|headless|monitor|pingdom|uptimerobot|curl|wget|python-requests|axios|node-fetch/i;
+app.get('/r', (req, res) => {
+  try {
+    if (!CLICK_DEST) return res.status(503).type('text').send('Click tracking is not configured (set CLICK_DEST).');
+    const ua = String(req.get('user-agent') || '');
+    if (!CLICK_BOT_RE.test(ua)) {
+      clicks.logClick({ ts: new Date().toISOString(), g: String(req.query.g || '').slice(0, 80), a: String(req.query.a || '').slice(0, 80), p: String(req.query.p || '').slice(0, 80), ip: req.ip, ua: ua.slice(0, 200) });
+    }
+    return res.redirect(302, CLICK_DEST);
+  } catch (e) { try { return CLICK_DEST ? res.redirect(302, CLICK_DEST) : res.status(500).end(); } catch { return; } }
+});
+// Aggregated click counts for the desktop app. Bearer <CLICK_TOKEN> ONLY (no ?token= query fallback — query strings leak
+// into proxy access logs, per the same reasoning that removed ?admin= from the admin route).
+app.get('/api/clicks', rateLimiter({ windowMs: 60000, max: 60, name: 'clicks' }), (req, res) => {
+  if (!CLICK_TOKEN) return res.status(403).json({ error: 'clicks disabled — set CLICK_TOKEN' });
+  const hdr = req.get('authorization') || '';
+  const provided = hdr.startsWith('Bearer ') ? hdr.slice(7).trim() : '';
+  if (provided !== CLICK_TOKEN) return res.status(403).json({ error: 'forbidden' });
+  try { res.json(clicks.aggregate(String(req.query.since || '').trim() || undefined)); } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
+});
+
 // Validate + bind a license to one machine (HWID). First activation binds; later launches must come
 // from the same machine. Revoked/expired keys are rejected. Returns the tier + limits the client
 // enforces (per-seat model).
