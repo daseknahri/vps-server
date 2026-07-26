@@ -20,7 +20,7 @@ function logClick(rec) {
 function aggregate(since) {
   let raw = '';
   try { raw = fs.readFileSync(FILE, 'utf8'); } catch { return { total: 0, byGroup: {}, byAccount: {}, byGroupAccount: {}, since: since || null }; }
-  const byGroup = {}, byAccount = {}, byGroupAccount = {};
+  const byGroup = {}, byAccount = {}, byGroupAccount = {}, byPost = {};
   let total = 0;
   for (const line of raw.split('\n')) {
     if (!line) continue;
@@ -29,11 +29,13 @@ function aggregate(since) {
     total++;
     const g = r.g != null ? String(r.g) : '';
     const a = r.a != null ? String(r.a) : '';
+    const p = r.p != null ? String(r.p) : '';
     if (g) byGroup[g] = (byGroup[g] || 0) + 1;
     if (a) byAccount[a] = (byAccount[a] || 0) + 1;
+    if (p) byPost[p] = (byPost[p] || 0) + 1;
     if (g && a) { const k = g + '|' + a; byGroupAccount[k] = (byGroupAccount[k] || 0) + 1; }
   }
-  return { total, byGroup, byAccount, byGroupAccount, since: since || null };
+  return { total, byGroup, byAccount, byGroupAccount, byPost, since: since || null };
 }
 
 module.exports = { logClick, aggregate, FILE };
