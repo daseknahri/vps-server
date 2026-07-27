@@ -190,7 +190,7 @@ app.get('/r', (req, res) => {
     if (!target) return res.status(503).type('text').send('Click tracking is not configured (set CLICK_DEST).');
     const ua = String(req.get('user-agent') || '');
     if (!CLICK_BOT_RE.test(ua)) {
-      clicks.logClick({ ts: new Date().toISOString(), g: String(req.query.g || '').slice(0, 80), a: String(req.query.a || '').slice(0, 80), p: String(req.query.p || '').slice(0, 80), u: uPath.slice(0, 300), ip: req.ip, ua: ua.slice(0, 200) });
+      clicks.logClick({ ts: new Date().toISOString(), g: String(req.query.g || '').slice(0, 80), a: String(req.query.a || '').slice(0, 80), p: String(req.query.p || '').slice(0, 80), c: String(req.query.c || '').slice(0, 80), u: uPath.slice(0, 300), ip: req.ip, ua: ua.slice(0, 200) });
     }
     return res.redirect(302, target);
   } catch (e) { try { return CLICK_DEST ? res.redirect(302, CLICK_DEST) : res.status(500).end(); } catch { return; } }
