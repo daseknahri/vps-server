@@ -6,8 +6,8 @@ key-audit.log
 node_modules/
 *.log
 data/
-
-# Ed25519 licence-SIGNING private key — belongs only in the Coolify env var (LICENSE_SIGNING_KEY).
-# Whoever holds it can mint a valid licence for any machine.
+# Ed25519 licence-SIGNING private key + ANY .pem — whoever holds it can mint valid licences for ANY machine, UNREVOCABLY
+# (rotating locks out every paying customer). It belongs ONLY on the VPS (env LICENSE_SIGNING_KEY / /data), NEVER committed.
+# (round-4 2026-07-28: this deploy-repo ignore was missing it while gen-signing-key.js writes exactly signing-key.pem.)
 signing-key.pem
 *.pem

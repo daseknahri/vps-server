@@ -169,19 +169,21 @@ app.get('/health', (_req, res) => res.status(200).json({ ok: true }));
 // per-group AND per-account totals. Isolated from licence validation: /r is public + wrapped so it can never throw, and
 // /api/clicks uses its OWN token (CLICK_TOKEN, least-privilege — NOT the admin token).
 const clicks = require('./clicks');
+const { decodeClick } = require('./clickToken'); // authentic clean links: /r/<slug>/<token> — decode the opaque analytics token
 const CLICK_DEST = String(process.env.CLICK_DEST || '').trim();
 const CLICK_TOKEN = String(process.env.CLICK_TOKEN || '').trim();
 // Per-post destinations: the app posts the REAL article URL in `u`, so a click lands on the right page (not one homepage).
 // To keep /r from being an open redirect (a phishing vector), `u` is honoured ONLY when its host is allow-listed: the host
 // of CLICK_DEST, plus any extra hosts in CLICK_HOSTS (comma-separated). Anything else falls back to CLICK_DEST.
 let CLICK_DEST_HOST = ''; try { CLICK_DEST_HOST = new URL(CLICK_DEST).host.toLowerCase(); } catch {}
+let CLICK_DEST_ORIGIN = ''; try { CLICK_DEST_ORIGIN = new URL(CLICK_DEST).origin; } catch {} // scheme+host of the blog — the FIXED base the /r/<slug>/<token> route rebuilds destinations against (so a click can never leave it)
 const CLICK_HOSTS = String(process.env.CLICK_HOSTS || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 const clickHostAllowed = (h) => { h = String(h || '').toLowerCase(); return (!!CLICK_DEST_HOST && h === CLICK_DEST_HOST) || CLICK_HOSTS.includes(h); };
 // Social/link-preview crawlers pre-fetch every posted link (Facebook fetches it once to build the preview card). Those are
 // NOT human clicks — filter them out of the count so the preview fetch doesn't inflate every group by one. Real users in
 // Facebook's in-app browser send FBAN/FBAV (NOT matched here), so their clicks are still counted.
 const CLICK_BOT_RE = /bot|crawl|spider|facebookexternalhit|facebot|linkpreview|preview|slurp|bingpreview|whatsapp|telegram|discord|headless|monitor|pingdom|uptimerobot|curl|wget|python-requests|axios|node-fetch/i;
-app.get('/r', (req, res) => {
+app.get('/r', rateLimiter({ windowMs: 60000, max: 600, name: 'r' }), (req, res) => { // round-4: /r had NO limiter (every other route does). Generous (600/min/IP ≈ 10/s — well above any legit shared-IP click rate) so it only trips an egregious single-IP flood; the clicks.js size cap is the hard disk-exhaustion backstop for a DISTRIBUTED flood.
   try {
     // Prefer the per-post article URL in `u` (host-allow-listed); else the shared CLICK_DEST.
     let target = CLICK_DEST, uPath = '';
@@ -193,6 +195,31 @@ app.get('/r', (req, res) => {
       clicks.logClick({ ts: new Date().toISOString(), g: String(req.query.g || '').slice(0, 80), a: String(req.query.a || '').slice(0, 80), p: String(req.query.p || '').slice(0, 80), c: String(req.query.c || '').slice(0, 80), u: uPath.slice(0, 300), ip: req.ip, ua: ua.slice(0, 200) });
     }
     return res.redirect(302, target);
+  } catch (e) { try { return CLICK_DEST ? res.redirect(302, CLICK_DEST) : res.status(500).end(); } catch { return; } }
+});
+// AUTHENTIC clean links (2026-08-01):  /r/<slug>/<token>  — the app publishes host/r/<real-article-slug>/<opaque-token>
+// instead of host/r?g=..&u=<realurl>. The visible slug reads like a genuine article; the analytics {g,a,p,c} ride in the
+// opaque token; the destination is NOT in the link — it is rebuilt HERE as CLICK_DEST_ORIGIN + '/' + slug (+ carried
+// query/fragment). Resolving the slug as a RELATIVE path against our own origin + re-checking the host allow-list makes
+// an open redirect impossible even though the slug is attacker-shaped. Same bot filter + logging shape as /r above.
+app.get('/r/*', rateLimiter({ windowMs: 60000, max: 600, name: 'r-clean' }), (req, res) => {
+  try {
+    if (!CLICK_DEST_ORIGIN) return CLICK_DEST ? res.redirect(302, CLICK_DEST) : res.status(503).type('text').send('Click tracking is not configured (set CLICK_DEST).');
+    const rest = String(req.params[0] || '');
+    const segs = rest.split('/').filter(Boolean);
+    const token = segs.pop() || '';
+    const slug = segs.join('/');
+    const payload = decodeClick(token);
+    if (!payload) return res.redirect(302, CLICK_DEST); // not one of our tokens (bare probe, favicon, typo) → the shared offer, no log
+    // Rebuild the destination against our FIXED origin. A relative resolve can't override the authority, and we re-verify
+    // the host allow-list; anything off-host falls back to CLICK_DEST (never an open redirect).
+    let dest = CLICK_DEST, destPath = '';
+    try { const d = new URL(slug + (payload.q || '') + (payload.f || ''), CLICK_DEST_ORIGIN + '/'); if (clickHostAllowed(d.host)) { dest = d.href; destPath = d.pathname; } } catch {}
+    const ua = String(req.get('user-agent') || '');
+    if (!CLICK_BOT_RE.test(ua)) {
+      clicks.logClick({ ts: new Date().toISOString(), g: String(payload.g || '').slice(0, 80), a: String(payload.a || '').slice(0, 80), p: String(payload.p || '').slice(0, 80), c: String(payload.c || '').slice(0, 80), u: destPath.slice(0, 300), ip: req.ip, ua: ua.slice(0, 200) });
+    }
+    return res.redirect(302, dest);
   } catch (e) { try { return CLICK_DEST ? res.redirect(302, CLICK_DEST) : res.status(500).end(); } catch { return; } }
 });
 // Aggregated click counts for the desktop app. Bearer <CLICK_TOKEN> ONLY (no ?token= query fallback — query strings leak
@@ -211,6 +238,11 @@ app.get('/api/clicks', rateLimiter({ windowMs: 60000, max: 60, name: 'clicks' })
 app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validate' }), (req, res) => {
   const license = String((req.body && req.body.license) || '').trim().toUpperCase();
   const hwid = String((req.body && req.body.hwid) || '').trim();
+  // round-4: reject an empty/short hwid up front. An empty hwid binds FALSY (rec.hwid='' → never actually locks, so any
+  // machine re-binds it) AND skips the "already active on another device" check below → a known key can be squatted/pre-bound
+  // by anyone who learns the string, locking out the real buyer. The legit client never POSTs a null/short id (a real
+  // machine id is 32+ chars); this only rejects malformed/malicious requests.
+  if (!hwid || hwid.length < 8) return res.json({ valid: false, message: 'Missing or invalid device id' });
   let db;
   try { db = ks.load(); } catch (e) { console.error('keys load:', e.message); return res.status(503).json({ valid: false, message: 'Server key store unavailable' }); }
   const rec = db[license];
