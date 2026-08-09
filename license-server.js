@@ -134,6 +134,14 @@ function rateLimiter({ windowMs, max, name }) {
   };
 }
 
+// Constant-time secret compare (2026-08-05 vps audit F2): the Bearer token guards the FULL keystore (/api/keys) and the
+// click data (/api/clicks); a short-circuiting `!==` leaks a prefix-length timing signal. timingSafeEqual on equal-length
+// buffers removes it (the length guard leaks only the length, not the secret).
+function safeEq(a, b) {
+  const ab = Buffer.from(String(a == null ? '' : a)), bb = Buffer.from(String(b == null ? '' : b));
+  if (ab.length !== bb.length) return false;
+  try { return crypto.timingSafeEqual(ab, bb); } catch { return false; }
+}
 // Admin auth — prefer Authorization: Bearer <ADMIN_TOKEN> (M3-04); the ?admin= query param is a
 // DEPRECATED fallback (it leaks into proxy/access logs). 403 when ADMIN_TOKEN is unset.
 function adminAuth(req, res, next) {
@@ -143,7 +151,7 @@ function adminAuth(req, res, next) {
   // Header-only (Bearer) — the ?admin= query fallback was removed: query strings leak into Nginx/Cloudflare
   // access logs, exposing ADMIN_TOKEN. Send `Authorization: Bearer <token>`.
   const provided = hdr.startsWith('Bearer ') ? hdr.slice(7).trim() : '';
-  if (provided !== token) return res.status(403).json({ error: 'forbidden' });
+  if (!safeEq(provided, token)) return res.status(403).json({ error: 'forbidden' });
   next();
 }
 
@@ -170,6 +178,7 @@ app.get('/health', (_req, res) => res.status(200).json({ ok: true }));
 // /api/clicks uses its OWN token (CLICK_TOKEN, least-privilege — NOT the admin token).
 const clicks = require('./clicks');
 const { decodeClick } = require('./clickToken'); // authentic clean links: /r/<slug>/<token> — decode the opaque analytics token
+const blogMap = require('./blogMap'); // MULTI-BLOG (2026-08-08): map an incoming tracking host (go.<blog>) → that blog's destination origin
 const CLICK_DEST = String(process.env.CLICK_DEST || '').trim();
 const CLICK_TOKEN = String(process.env.CLICK_TOKEN || '').trim();
 // Per-post destinations: the app posts the REAL article URL in `u`, so a click lands on the right page (not one homepage).
@@ -188,7 +197,7 @@ app.get('/r', rateLimiter({ windowMs: 60000, max: 600, name: 'r' }), (req, res) 
     // Prefer the per-post article URL in `u` (host-allow-listed); else the shared CLICK_DEST.
     let target = CLICK_DEST, uPath = '';
     const u = String(req.query.u || '');
-    if (u) { try { const x = new URL(u); uPath = x.pathname; if (clickHostAllowed(x.host)) target = u; } catch {} }
+    if (u) { try { const x = new URL(u); uPath = x.pathname; if (clickHostAllowed(x.host)) target = x.href; } catch {} } // send the WHATWG-normalized href (not the raw u) so a tab/newline differential-parse can't smuggle a Location header (2026-08-05 vps audit F7; matches the /r/* clean route's d.href)
     if (!target) return res.status(503).type('text').send('Click tracking is not configured (set CLICK_DEST).');
     const ua = String(req.get('user-agent') || '');
     if (!CLICK_BOT_RE.test(ua)) {
@@ -204,20 +213,25 @@ app.get('/r', rateLimiter({ windowMs: 60000, max: 600, name: 'r' }), (req, res) 
 // an open redirect impossible even though the slug is attacker-shaped. Same bot filter + logging shape as /r above.
 app.get('/r/*', rateLimiter({ windowMs: 60000, max: 600, name: 'r-clean' }), (req, res) => {
   try {
-    if (!CLICK_DEST_ORIGIN) return CLICK_DEST ? res.redirect(302, CLICK_DEST) : res.status(503).type('text').send('Click tracking is not configured (set CLICK_DEST).');
+    // MULTI-BLOG: the destination origin is the blog THIS tracking host fronts (go.<blog> → https://<blog>), from blogMap.
+    // Fall back to the legacy single CLICK_DEST_ORIGIN so links already live on the VPS's own host keep resolving.
+    const blogOrigin = blogMap.resolve(req.hostname) || CLICK_DEST_ORIGIN;
+    if (!blogOrigin) return CLICK_DEST ? res.redirect(302, CLICK_DEST) : res.status(503).type('text').send('Click tracking is not configured (set CLICK_BLOGS / blogs.json or CLICK_DEST).');
+    let blogHost = ''; try { blogHost = new URL(blogOrigin).host.toLowerCase(); } catch {}
     const rest = String(req.params[0] || '');
     const segs = rest.split('/').filter(Boolean);
     const token = segs.pop() || '';
     const slug = segs.join('/');
     const payload = decodeClick(token);
     if (!payload) return res.redirect(302, CLICK_DEST); // not one of our tokens (bare probe, favicon, typo) → the shared offer, no log
-    // Rebuild the destination against our FIXED origin. A relative resolve can't override the authority, and we re-verify
-    // the host allow-list; anything off-host falls back to CLICK_DEST (never an open redirect).
+    // Rebuild the destination against the RESOLVED blog origin. A relative resolve can't override the authority; re-verify the
+    // rebuilt host is the blog's OWN host (per-blog) or globally allow-listed (legacy links / CLICK_HOSTS). Else → CLICK_DEST
+    // (never an open redirect, regardless of what the attacker-shaped slug says).
     let dest = CLICK_DEST, destPath = '';
-    try { const d = new URL(slug + (payload.q || '') + (payload.f || ''), CLICK_DEST_ORIGIN + '/'); if (clickHostAllowed(d.host)) { dest = d.href; destPath = d.pathname; } } catch {}
+    try { const d = new URL(slug + (payload.q || '') + (payload.f || ''), blogOrigin + '/'); const dh = d.host.toLowerCase(); if (dh === blogHost || clickHostAllowed(dh)) { dest = d.href; destPath = d.pathname; } } catch {}
     const ua = String(req.get('user-agent') || '');
     if (!CLICK_BOT_RE.test(ua)) {
-      clicks.logClick({ ts: new Date().toISOString(), g: String(payload.g || '').slice(0, 80), a: String(payload.a || '').slice(0, 80), p: String(payload.p || '').slice(0, 80), c: String(payload.c || '').slice(0, 80), u: destPath.slice(0, 300), ip: req.ip, ua: ua.slice(0, 200) });
+      clicks.logClick({ ts: new Date().toISOString(), g: String(payload.g || '').slice(0, 80), a: String(payload.a || '').slice(0, 80), p: String(payload.p || '').slice(0, 80), c: String(payload.c || '').slice(0, 80), u: destPath.slice(0, 300), b: blogHost.slice(0, 120), ip: req.ip, ua: ua.slice(0, 200) });
     }
     return res.redirect(302, dest);
   } catch (e) { try { return CLICK_DEST ? res.redirect(302, CLICK_DEST) : res.status(500).end(); } catch { return; } }
@@ -228,10 +242,15 @@ app.get('/api/clicks', rateLimiter({ windowMs: 60000, max: 60, name: 'clicks' })
   if (!CLICK_TOKEN) return res.status(403).json({ error: 'clicks disabled — set CLICK_TOKEN' });
   const hdr = req.get('authorization') || '';
   const provided = hdr.startsWith('Bearer ') ? hdr.slice(7).trim() : '';
-  if (provided !== CLICK_TOKEN) return res.status(403).json({ error: 'forbidden' });
+  if (!safeEq(provided, CLICK_TOKEN)) return res.status(403).json({ error: 'forbidden' });
   try { res.json(clicks.aggregate(String(req.query.since || '').trim() || undefined)); } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
 });
 
+// DEBOUNCE the lastSeen persist (2026-08-05 vps audit F1): a re-validation only needs to REFRESH lastSeen, but writing the
+// whole (scryptSync-encrypted) store on EVERY launch is what a flood weaponizes. Persist at most hourly per license; the
+// in-memory value (in the mtime-cached store) is always current. Not persisted across a restart — it rebuilds on the first
+// post-restart validate. license → last-persisted-ts.
+const _lastSeenSaved = new Map();
 // Validate + bind a license to one machine (HWID). First activation binds; later launches must come
 // from the same machine. Revoked/expired keys are rejected. Returns the tier + limits the client
 // enforces (per-seat model).
@@ -260,7 +279,9 @@ app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validat
   });
   if (!rec.hwid) { rec.hwid = hwid; rec.activatedAt = Date.now(); ks.save(db); ks.audit('bind', license, 'hwid=' + hwid.slice(0, 8)); return res.json({ ...grant(), message: 'Activated' }); }
   if (hwid && rec.hwid !== hwid) return res.json({ valid: false, message: 'License is already active on another device' });
-  rec.lastSeen = Date.now(); ks.save(db);
+  rec.lastSeen = Date.now(); // always current in the in-memory (cached) store
+  const _lsPrev = _lastSeenSaved.get(license) || 0;
+  if (rec.lastSeen - _lsPrev > 3600000) { _lastSeenSaved.set(license, rec.lastSeen); ks.save(db); } // persist at most hourly per license (mtime-cached load + this debounce = a re-validation flood costs ~0 scrypt/disk)
   return res.json(grant());
 });
 

@@ -33,8 +33,8 @@ function logClick(rec) {
 // non-JSON lines are skipped (never throws). `since` (ISO string, optional) limits to clicks at/after that instant.
 function aggregate(since) {
   let raw = '';
-  try { raw = fs.readFileSync(FILE, 'utf8'); } catch { return { total: 0, byGroup: {}, byAccount: {}, byGroupAccount: {}, since: since || null }; }
-  const byGroup = {}, byAccount = {}, byGroupAccount = {}, byPost = {}, byCategory = {};
+  try { raw = fs.readFileSync(FILE, 'utf8'); } catch { return { total: 0, byGroup: {}, byAccount: {}, byGroupAccount: {}, byBlog: {}, since: since || null }; }
+  const byGroup = {}, byAccount = {}, byGroupAccount = {}, byPost = {}, byCategory = {}, byBlog = {};
   let total = 0;
   for (const line of raw.split('\n')) {
     if (!line) continue;
@@ -45,13 +45,15 @@ function aggregate(since) {
     const a = r.a != null ? String(r.a) : '';
     const p = r.p != null ? String(r.p) : '';
     const c = r.c != null ? String(r.c) : '';
+    const b = r.b != null ? String(r.b) : ''; // b = the blog host the click landed on (MULTI-BLOG, 2026-08-08); absent on pre-multi-blog rows
     if (g) byGroup[g] = (byGroup[g] || 0) + 1;
     if (a) byAccount[a] = (byAccount[a] || 0) + 1;
     if (p) byPost[p] = (byPost[p] || 0) + 1;
     if (c) byCategory[c] = (byCategory[c] || 0) + 1; // c = post CATEGORY (post-set) — stable across runs
+    if (b) byBlog[b] = (byBlog[b] || 0) + 1;
     if (g && a) { const k = g + '|' + a; byGroupAccount[k] = (byGroupAccount[k] || 0) + 1; }
   }
-  return { total, byGroup, byAccount, byGroupAccount, byPost, byCategory, since: since || null };
+  return { total, byGroup, byAccount, byGroupAccount, byPost, byCategory, byBlog, since: since || null };
 }
 
 module.exports = { logClick, aggregate, FILE };

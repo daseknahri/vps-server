@@ -22,7 +22,7 @@ node gen-key.js "trial" 7              # new key, expires in 7 days
 node revoke.js  AAAA-BBBB-CCCC-DDDD    # revoke a key (app shows revoked.html)
 node revoke.js  AAAA-... --unbind      # revoke + clear machine binding
 node revoke.js  AAAA-... --restore     # un-revoke
-curl "http://localhost:3509/api/keys?admin=pick-a-secret"   # list all keys
+curl -H "Authorization: Bearer $ADMIN_TOKEN" "http://localhost:3509/api/keys"   # list all keys (Bearer only — the ?admin= query fallback was removed so the token can't leak into proxy/access logs)
 ```
 
 ## How it works

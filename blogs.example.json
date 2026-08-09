@@ -1,0 +1,6 @@
+{
+  "_comment": "MULTI-BLOG click routing (2026-08-08). Copy this to /data/blogs.json on the VPS (the persistent volume) and edit. Map each TRACKING host (the go.<blog> subdomain the app publishes, and that you DNS-point at this VPS) to that blog's real destination ORIGIN. Editing this file needs NO redeploy (it is mtime-cached). Alternatively set the same JSON as the CLICK_BLOGS env var. Keys are hosts, values are origins (scheme+host).",
+  "go.recipeblog.com": "https://recipeblog.com",
+  "go.travelblog.com": "https://travelblog.com",
+  "go.fitness-example.com": "https://fitness-example.com"
+}

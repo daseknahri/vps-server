@@ -112,6 +112,78 @@ KEYS_PATH=/data/keys.json node revoke.js  AAAA-BBBB-CCCC-DDDD # revoke
 
 ---
 
+## Multi-blog click tracking (2026-08-08)
+
+Each of your blogs fronts its OWN tracked links: the app publishes `https://go.<blog>/r/<article-slug>/<token>`, the
+server resolves the incoming host (`go.<blog>`) back to that blog's origin and 302s to the real article. One VPS, N
+blog-branded hosts, one central clicks log. Do these once per blog.
+
+### A. Ship the code (the #1 gotcha — see Step 1)
+The multi-blog change adds **`blogMap.js`** and edits **`license-server.js`** + **`clicks.js`**. Coolify deploys from
+`daseknahri/vps-server`, NOT this working copy — copy all three (plus `blogs.example.json`) into that repo, commit, push,
+then redeploy. Editing this folder ships nothing.
+
+### B. DNS — one record per blog
+For each blog, create a subdomain that points at the VPS (same box the license server runs on):
+```
+go.recipeblog.com    A     <YOUR_VPS_IP>      # from Hostinger → your VPS. (CNAME → recipes.ibnbatoutaweb.com also works for a subdomain.)
+```
+Repeat for every blog (`go.travelblog.com`, …). Let propagation finish (`nslookup go.recipeblog.com` → your VPS IP).
+
+### C. Coolify — add each go.<blog> as a domain
+On the vps-server resource → **Domains**, add every tracking host so Traefik routes it AND issues its Let's Encrypt
+cert (HTTP-01, automatic). Space/comma-separate them:
+```
+https://recipes.ibnbatoutaweb.com, https://go.recipeblog.com, https://go.travelblog.com
+```
+Keep your existing license/clicks domain in the list. Redeploy (or let Coolify apply) and wait for the padlock on each
+`https://go.<blog>/health`.
+
+### D. The blog map — tracking host → blog origin
+Map each `go.<blog>` to that blog's real origin. **Preferred (no redeploy):** create the file on the persistent volume
+via the Coolify **Terminal**:
+```bash
+cat > /data/blogs.json <<'JSON'
+{
+  "go.recipeblog.com": "https://recipeblog.com",
+  "go.travelblog.com": "https://travelblog.com"
+}
+JSON
+```
+Edit that file any time to add a blog — it is mtime-cached, picked up within a request, no redeploy. **Alternative**
+(config-as-env): set `CLICK_BLOGS` to the same JSON as one line and redeploy. `blogs.json` wins if both exist. Your
+existing `CLICK_DEST` / `CLICK_TOKEN` / `CLICK_HOSTS` stay as-is — they remain the fallback + the shared offer, and keep
+already-live links resolving.
+
+### E. Point the app at your blogs
+App → **Settings → Tracking**:
+- Mode = **Clean multi-blog links**
+- **Blog list** (one per line — must match the `blogs.json` keys' blogs):
+  ```
+  recipeblog.com
+  travelblog.com
+  ```
+  (Each `recipeblog.com` auto-publishes as `go.recipeblog.com`. Use `site > track.host` only if your tracking host
+  isn't `go.<site>`.)
+- **Clicks API** = `https://recipes.ibnbatoutaweb.com/api/clicks` · **token** = your `CLICK_TOKEN`
+
+### F. Smoke-test ONE blog before a full run
+Mint a test token (Coolify Terminal, in `/app`) and hit a REAL article slug on that blog:
+```bash
+TOK=$(node -e "console.log(require('./clickToken').encodeClick({g:'smoke',a:'smoke',p:'smoke',c:'smoke'}))")
+# expect: HTTP/1.1 302 + Location: https://recipeblog.com/<a-real-slug>
+curl -sI "https://go.recipeblog.com/r/<a-real-slug>/$TOK"
+# expect the click to appear (total ≥ 1, and byBlog has go.recipeblog.com's origin host)
+curl -s -H "Authorization: Bearer <YOUR_CLICK_TOKEN>" "https://recipes.ibnbatoutaweb.com/api/clicks" | head -c 400
+```
+Green on both → the app's **Refresh clicks** will now populate. Only then roll out to a full run.
+
+### Rollback
+Set Tracking back to **Off** in the app (posts the real links untracked, instantly). The server change is additive — the
+legacy `/r` + single-origin routes are untouched, so nothing already posted breaks.
+
+---
+
 ### Notes
 - Redeploys keep your keys (volume at `/data`). `OWNER_KEY` only seeds the owner key into an
   empty volume on first run — it never overwrites existing keys or bindings.
