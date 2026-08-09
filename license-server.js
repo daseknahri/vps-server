@@ -236,6 +236,25 @@ app.get('/r/*', rateLimiter({ windowMs: 60000, max: 600, name: 'r-clean' }), (re
     return res.redirect(302, dest);
   } catch (e) { try { return CLICK_DEST ? res.redirect(302, CLICK_DEST) : res.status(500).end(); } catch { return; } }
 });
+// TRACKING PIXEL (2026-08-08, multi-blog-via-the-blog-itself): the app posts the REAL article link with a ?ref=<token> tag,
+// so the link stays a genuine article on the blog's own domain (Facebook shows the real card, no redirect). Counting is done
+// BY THE BLOG: the za-click-pixel mu-plugin, when a real visitor opens a ?ref= link, loads this 1×1 pixel with the token (t)
+// and the blog host (b). We decode the analytics {g,a,p,c}, log the click, and return a transparent GIF. Bot UAs are filtered
+// (the plugin already skips them server-side; this is a second guard). no-store so each open re-fetches (a cached pixel would
+// undercount). Isolated + wrapped so it can never throw. Same clicks log + /api/clicks aggregation as /r.
+const PX_GIF = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64'); // 1×1 transparent GIF
+app.get('/px', rateLimiter({ windowMs: 60000, max: 1200, name: 'px' }), (req, res) => {
+  try {
+    const payload = decodeClick(String(req.query.t || ''));
+    const ua = String(req.get('user-agent') || '');
+    if (payload && !CLICK_BOT_RE.test(ua)) {
+      const b = String(req.query.b || '').toLowerCase().replace(/[^a-z0-9.\-]/g, '').slice(0, 120); // blog host, set by the plugin
+      clicks.logClick({ ts: new Date().toISOString(), g: String(payload.g || '').slice(0, 80), a: String(payload.a || '').slice(0, 80), p: String(payload.p || '').slice(0, 80), c: String(payload.c || '').slice(0, 80), u: '', b, ip: req.ip, ua: ua.slice(0, 200) });
+    }
+  } catch {}
+  try { res.set('Content-Type', 'image/gif'); res.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0'); res.set('Pragma', 'no-cache'); return res.status(200).end(PX_GIF); }
+  catch { try { return res.status(204).end(); } catch { return; } }
+});
 // Aggregated click counts for the desktop app. Bearer <CLICK_TOKEN> ONLY (no ?token= query fallback — query strings leak
 // into proxy access logs, per the same reasoning that removed ?admin= from the admin route).
 app.get('/api/clicks', rateLimiter({ windowMs: 60000, max: 60, name: 'clicks' }), (req, res) => {
