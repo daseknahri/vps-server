@@ -33,8 +33,8 @@ function logClick(rec) {
 // non-JSON lines are skipped (never throws). `since` (ISO string, optional) limits to clicks at/after that instant.
 function aggregate(since) {
   let raw = '';
-  try { raw = fs.readFileSync(FILE, 'utf8'); } catch { return { total: 0, byGroup: {}, byAccount: {}, byGroupAccount: {}, byBlog: {}, since: since || null }; }
-  const byGroup = {}, byAccount = {}, byGroupAccount = {}, byPost = {}, byCategory = {}, byBlog = {};
+  try { raw = fs.readFileSync(FILE, 'utf8'); } catch { return { total: 0, byGroup: {}, byAccount: {}, byGroupAccount: {}, byBlog: {}, byArticle: {}, since: since || null }; }
+  const byGroup = {}, byAccount = {}, byGroupAccount = {}, byPost = {}, byCategory = {}, byBlog = {}, byArticle = {};
   let total = 0;
   for (const line of raw.split('\n')) {
     if (!line) continue;
@@ -52,8 +52,29 @@ function aggregate(since) {
     if (c) byCategory[c] = (byCategory[c] || 0) + 1; // c = post CATEGORY (post-set) — stable across runs
     if (b) byBlog[b] = (byBlog[b] || 0) + 1;
     if (g && a) { const k = g + '|' + a; byGroupAccount[k] = (byGroupAccount[k] || 0) + 1; }
+    // Server-side pageview rows (the /log route, za-click-log mu-plugin): a Facebook-referred article view counted on the
+    // WordPress SERVER — no g/a/p/c token, no on-page beacon, so it can't affect ad RPM. Count FB clicks per (blog, article).
+    const _pth = r.path != null ? String(r.path) : '';
+    if (b && _pth) { const k = b + ' ' + _pth; byArticle[k] = (byArticle[k] || 0) + 1; }
   }
-  return { total, byGroup, byAccount, byGroupAccount, byPost, byCategory, byBlog, since: since || null };
+  return { total, byGroup, byAccount, byGroupAccount, byPost, byCategory, byBlog, byArticle, since: since || null };
 }
 
-module.exports = { logClick, aggregate, FILE };
+// Raw SERVER-SIDE pageview rows (za-click-log via /log) for app-side time-correlation attribution — only rows that carry a
+// `path` (the clean-link server-side views); legacy token-click rows (g/a/p/c) are excluded. `since` (ISO) optional. The
+// app joins these with its own delivery log to recover per-group/account attribution without any on-page token.
+function pageviews(since) {
+  let raw = '';
+  try { raw = fs.readFileSync(FILE, 'utf8'); } catch { return []; }
+  const out = [];
+  for (const line of raw.split('\n')) {
+    if (!line) continue;
+    let r; try { r = JSON.parse(line); } catch { continue; }
+    if (!r || r.path == null) continue;
+    if (since && String(r.ts || '') < since) continue;
+    out.push({ ts: r.ts, b: r.b, path: r.path });
+  }
+  return out;
+}
+
+module.exports = { logClick, aggregate, pageviews, FILE };

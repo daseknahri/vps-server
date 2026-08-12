@@ -265,6 +265,32 @@ app.get('/api/clicks', rateLimiter({ windowMs: 60000, max: 60, name: 'clicks' })
   try { res.json(clicks.aggregate(String(req.query.since || '').trim() || undefined)); } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
 });
 
+// SERVER-SIDE pageview log (2026-08-12): the za-click-log mu-plugin fire-and-forgets a POST here on a Facebook-referred
+// article view. Unlike the /px client pixel, there is NO on-page beacon and NO tracking token in the URL — the count
+// happens on the WordPress SERVER, invisible to the ad tags, so it CANNOT affect AdSense/AdX RPM (the whole reason /px
+// collapsed RPM). Same clicks store, aggregated per (blog, article) as `byArticle`. Per-post/group is recovered app-side
+// by time-correlating with the poster's delivery log (the clean links carry no token). Bot-filtered server-side like /px.
+app.post('/log', rateLimiter({ windowMs: 60000, max: 6000, name: 'log' }), (req, res) => {
+  try {
+    const b = String((req.body && req.body.b) || '').toLowerCase().replace(/[^a-z0-9.\-]/g, '').slice(0, 120);
+    const pth = String((req.body && req.body.p) || '').slice(0, 300);
+    const f = String((req.body && req.body.f) || '').slice(0, 120);
+    const ua = String(req.get('user-agent') || '');
+    if (b && pth && !CLICK_BOT_RE.test(ua)) { clicks.logClick({ ts: new Date().toISOString(), b, path: pth, f, ip: req.ip }); }
+  } catch {}
+  try { return res.status(204).end(); } catch { return; }
+});
+
+// Raw server-side pageviews for the desktop app's time-correlation attribution (Bearer <CLICK_TOKEN>, same as /api/clicks).
+// The app fetches these and joins them with its own delivery log to recover per-group/account clicks — no on-page token.
+app.get('/api/pageviews', rateLimiter({ windowMs: 60000, max: 60, name: 'pageviews' }), (req, res) => {
+  if (!CLICK_TOKEN) return res.status(403).json({ error: 'clicks disabled — set CLICK_TOKEN' });
+  const hdr = req.get('authorization') || '';
+  const provided = hdr.startsWith('Bearer ') ? hdr.slice(7).trim() : '';
+  if (!safeEq(provided, CLICK_TOKEN)) return res.status(403).json({ error: 'forbidden' });
+  try { res.json({ pageviews: clicks.pageviews(String(req.query.since || '').trim() || undefined) }); } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
+});
+
 // DEBOUNCE the lastSeen persist (2026-08-05 vps audit F1): a re-validation only needs to REFRESH lastSeen, but writing the
 // whole (scryptSync-encrypted) store on EVERY launch is what a flood weaponizes. Persist at most hourly per license; the
 // in-memory value (in the mtime-cached store) is always current. Not persisted across a restart — it rebuilds on the first
@@ -296,7 +322,7 @@ app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validat
     // key store did not actually bind.
     ...signGrant({ license, hwid: rec.hwid || hwid, tier: rec.tier, expires: rec.expires, nonce }),
   });
-  if (!rec.hwid) { rec.hwid = hwid; rec.activatedAt = Date.now(); ks.save(db); ks.audit('bind', license, 'hwid=' + hwid.slice(0, 8)); return res.json({ ...grant(), message: 'Activated' }); }
+  if (rec.hwid == null) { rec.hwid = hwid; rec.activatedAt = Date.now(); ks.save(db); ks.audit('bind', license, 'hwid=' + hwid.slice(0, 8)); return res.json({ ...grant(), message: 'Activated' }); } // == null (not !rec.hwid): a genuinely UNBOUND record is null (gen-key / reset-hwid); a hand-edited/legacy '' hwid must NOT be treated as bindable-by-anyone — it falls to the strict compare below and is rejected as "already active on another device" (fail closed). New binds always write a ≥8-char id (front-door gate), so real records are never '' → no legit impact.
   if (hwid && rec.hwid !== hwid) return res.json({ valid: false, message: 'License is already active on another device' });
   rec.lastSeen = Date.now(); // always current in the in-memory (cached) store
   const _lsPrev = _lastSeenSaved.get(license) || 0;
