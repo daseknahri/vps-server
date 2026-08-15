@@ -65,4 +65,69 @@ function audit(event, license, detail) {
   try { fs.appendFileSync(auditPath(), JSON.stringify({ ts: new Date().toISOString(), event, key: String(license || '').slice(0, 4) + '…', detail: detail || '' }) + '\n'); } catch {}
 }
 
-module.exports = { load, save, audit, keysPath, isEncryptedAtRest };
+// ★RANK-2 (2026-08-15): server-side clone detection. The CLIENT device-lock cannot catch a MachineGuid CLONE — every copy
+// presents the SAME bound hwid, so /api/validate's `rec.hwid !== hwid` check passes for all of them. But a cloned key
+// validates from MANY IPs where one honest seat uses ~1. This records recent distinct IPs per key in a bounded, time-windowed
+// log; the caller FLAGS (never auto-denies — a roaming/mobile/VPN customer legitimately spans IPs) when the fan-out is high,
+// for operator review + manual revoke. PURE (mutates rec.ipLog in place, no I/O) → unit-tested. Returns the current fan-out.
+function recordValidationIp(rec, ip, now, opts) {
+  opts = opts || {};
+  const windowMs = Number(opts.windowMs) || 24 * 3600 * 1000;
+  const maxLog = Number(opts.maxLog) || 50;
+  if (!rec || !ip) return { distinct: 0, isNew: false };
+  let log = Array.isArray(rec.ipLog) ? rec.ipLog.filter((e) => e && e.ip && (now - Number(e.ts) <= windowMs)) : [];
+  const isNew = !log.some((e) => e.ip === ip);
+  if (isNew) log.push({ ip: String(ip), ts: now });
+  if (log.length > maxLog) log = log.slice(-maxLog);
+  rec.ipLog = log;
+  return { distinct: new Set(log.map((e) => e.ip)).size, isNew };
+}
+
+// ★VERSION GATE (2026-08-15): compare two dotted numeric versions. Returns true iff a < b. Tolerant of missing parts +
+// non-numeric segments (treated as 0) and never throws — a garbled version string must never gate a legit client (the
+// caller only gates when BOTH the client version AND the required minimum are present + parse to real numbers).
+function semverLt(a, b) {
+  const pa = String(a == null ? '' : a).split('.').map((x) => parseInt(x, 10) || 0);
+  const pb = String(b == null ? '' : b).split('.').map((x) => parseInt(x, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const da = pa[i] || 0, dbv = pb[i] || 0;
+    if (da < dbv) return true;
+    if (da > dbv) return false;
+  }
+  return false; // equal → not less-than
+}
+
+// ★2026-08-15 per-brand telemetry aggregation. ONE client runs all 4 brand-apps (same key, separate userData each); each
+// reports its OWN account/group counts, so store them PER BRAND and let the reader SUM → a combined per-client total.
+// `brand` is client-controlled and becomes an object key → sanitize HARD: strip to [a-z0-9-] (removing the underscores that
+// make __proto__ dangerous), cap length, and reject the pollution names. Prunes brands unseen for `staleMs`. Returns the
+// safe brand stored, or null if the brand was empty/rejected (the caller then keeps flat single-app telemetry for old clients).
+function recordAppTelemetry(rec, brand, info, now, opts) {
+  if (!rec) return null;
+  opts = opts || {}; info = info || {};
+  const staleMs = Number(opts.staleMs) || 14 * 86400000;
+  const sb = String(brand == null ? '' : brand).replace(/[^a-z0-9-]/gi, '').slice(0, 40).toLowerCase();
+  if (!sb || sb === '__proto__' || sb === 'constructor' || sb === 'prototype') return null;
+  if (!rec.apps || typeof rec.apps !== 'object') rec.apps = {};
+  const prev = rec.apps[sb] || {};
+  rec.apps[sb] = { ver: info.ver || prev.ver || '', acc: Number(info.acc) || 0, grp: Number(info.grp) || 0, at: now };
+  for (const b of Object.keys(rec.apps)) { if (!rec.apps[b] || (now - Number(rec.apps[b].at || 0)) > staleMs) delete rec.apps[b]; }
+  // HARDENING: cap the brand count so a malicious client spamming many distinct brands can't bloat the keystore (a real
+  // client runs ≤4 brands; 16 tolerates renames/churn). Drop the OLDEST beyond the cap — but never the one just written.
+  const MAX = Number(opts.maxBrands) || 16, bs = Object.keys(rec.apps);
+  if (bs.length > MAX) { bs.sort((a, b) => Number(rec.apps[a].at || 0) - Number(rec.apps[b].at || 0)); for (const b of bs.slice(0, bs.length - MAX)) { if (b !== sb) delete rec.apps[b]; } }
+  return sb;
+}
+// Sum accounts + groups across a key's brand-apps → the COMBINED per-client total. Falls back to the flat lastAccounts/
+// lastGroups for an older client that never reported a brand. Pure read.
+function sumAppTelemetry(rec) {
+  rec = rec || {};
+  if (rec.apps && typeof rec.apps === 'object') {
+    let acc = 0, grp = 0, n = 0;
+    for (const b of Object.keys(rec.apps)) { const a = rec.apps[b] || {}; acc += Number(a.acc) || 0; grp += Number(a.grp) || 0; n++; }
+    return { acc, grp, apps: n };
+  }
+  return { acc: Number(rec.lastAccounts) || 0, grp: Number(rec.lastGroups) || 0, apps: 0 };
+}
+
+module.exports = { load, save, audit, keysPath, isEncryptedAtRest, recordValidationIp, semverLt, recordAppTelemetry, sumAppTelemetry };

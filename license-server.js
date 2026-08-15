@@ -302,6 +302,9 @@ const _lastSeenSaved = new Map();
 app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validate' }), (req, res) => {
   const license = String((req.body && req.body.license) || '').trim().toUpperCase();
   const hwid = String((req.body && req.body.hwid) || '').trim();
+  const ver = String((req.body && req.body.ver) || '').replace(/[^0-9.a-z-]/gi, '').slice(0, 24); // client app version — telemetry + the version gate. STRIP to version chars (adversary #2): ver is rendered RAW in list-keys.js, so control/ANSI chars could hide a CLONE flag in the operator's terminal. ('' from an older client → grandfathered)
+  const acc = Math.max(0, Math.min(99999, Number((req.body && req.body.acc)) || 0)); // reported account count — telemetry only
+  const grp = Math.max(0, Math.min(99999, Number((req.body && req.body.grp)) || 0)); // reported group count — telemetry only
   // round-4: reject an empty/short hwid up front. An empty hwid binds FALSY (rec.hwid='' → never actually locks, so any
   // machine re-binds it) AND skips the "already active on another device" check below → a known key can be squatted/pre-bound
   // by anyone who learns the string, locking out the real buyer. The legit client never POSTs a null/short id (a real
@@ -309,10 +312,21 @@ app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validat
   if (!hwid || hwid.length < 8) return res.json({ valid: false, message: 'Missing or invalid device id' });
   let db;
   try { db = ks.load(); } catch (e) { console.error('keys load:', e.message); return res.status(503).json({ valid: false, message: 'Server key store unavailable' }); }
-  const rec = db[license];
+  const rec = Object.prototype.hasOwnProperty.call(db, license) ? db[license] : undefined; // OWN-property only (adversary note): don't let db['__proto__'] etc. resolve to an inherited object; belt-and-suspenders beyond the toUpperCase that already misses __proto__
   if (!rec) return res.json({ valid: false, message: 'Invalid license key' });
   if (rec.revoked) return res.json({ valid: false, revoked: true, message: 'This license has been revoked' });
   if (rec.expires && Date.now() > rec.expires) return res.json({ valid: false, message: 'License expired' });
+  // ★2026-08-15 SUSPEND (reversible, operator-set via suspend.js after reviewing a clone flag): honor a suspended seat.
+  // Fail-CLOSED, but deliberate → no false-positive lockout; distinct from revoke (permanent, wipes the client cache).
+  if (rec.suspended) return res.json({ valid: false, suspended: true, message: rec.suspendMessage || 'License suspended — contact support.' });
+  // ★2026-08-15 VERSION GATE: reject a client older than the required minimum (per-key rec.minVersion OR global env
+  // MIN_CLIENT_VERSION). FORCES HONEST clients to update + retires old versions — NOT anti-piracy (adversary #3: a cracked
+  // client self-reports ver='' → grandfathered, or a fake-high ver; for theft rely on revoke/suspend + the asar-integrity
+  // seal). FAIL-OPEN for the no-version / unset-min cases. ⚠ OPERATOR FOOTGUN (adversary #4): set the minimum ≤ the version
+  // you have ACTUALLY shipped — a value ABOVE it locks out the WHOLE up-to-date fleet (every seat reports a real ver < min →
+  // valid:false, no offline grace). Recoverable in ≤1h by fixing the env (the fleet re-validates hourly); a boot warning fires.
+  const _minVer = String(rec.minVersion || process.env.MIN_CLIENT_VERSION || '').trim();
+  if (_minVer && ver && ks.semverLt(ver, _minVer)) return res.json({ valid: false, outdated: true, minVersion: _minVer, message: 'Please update to version ' + _minVer + ' or later to continue.' });
   // Echo the client's nonce inside the signed token so this response cannot be replayed to activate a second
   // install. Capped — it is opaque to us and only ever compared for equality.
   const nonce = String((req.body && req.body.nonce) || '').trim().slice(0, 64);
@@ -325,8 +339,34 @@ app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validat
   if (rec.hwid == null) { rec.hwid = hwid; rec.activatedAt = Date.now(); ks.save(db); ks.audit('bind', license, 'hwid=' + hwid.slice(0, 8)); return res.json({ ...grant(), message: 'Activated' }); } // == null (not !rec.hwid): a genuinely UNBOUND record is null (gen-key / reset-hwid); a hand-edited/legacy '' hwid must NOT be treated as bindable-by-anyone — it falls to the strict compare below and is rejected as "already active on another device" (fail closed). New binds always write a ≥8-char id (front-door gate), so real records are never '' → no legit impact.
   if (hwid && rec.hwid !== hwid) return res.json({ valid: false, message: 'License is already active on another device' });
   rec.lastSeen = Date.now(); // always current in the in-memory (cached) store
+  // ★2026-08-15 telemetry — PER-BRAND so ONE client running all 4 brand-apps (same key + hwid, separate userData each,
+  // reporting on their own cycles) shows a COMBINED total instead of the apps overwriting each other's counts. `brand` is
+  // client-controlled and becomes an object key → sanitize HARD: strip to [a-z0-9-] (removes the underscores in __proto__),
+  // cap length, and reject the prototype-pollution names. Prune brands not seen in 14 days so a client that stopped running
+  // one app doesn't inflate the total forever. Bounded (a handful of brands per key). list-keys.js sums rec.apps.
+  if (ver) rec.lastVersion = ver; // keep the most-recent version at top level (backward-compat + display)
+  const _sb = ks.recordAppTelemetry(rec, brand, { ver, acc, grp }, rec.lastSeen); // per-brand aggregate → combined per-client total (list-keys.js sums rec.apps)
+  if (!_sb) { if (acc) rec.lastAccounts = acc; if (grp) rec.lastGroups = grp; } // no brand (older client) → flat single-app telemetry
   const _lsPrev = _lastSeenSaved.get(license) || 0;
-  if (rec.lastSeen - _lsPrev > 3600000) { _lastSeenSaved.set(license, rec.lastSeen); ks.save(db); } // persist at most hourly per license (mtime-cached load + this debounce = a re-validation flood costs ~0 scrypt/disk)
+  let _persisted = false;
+  if (rec.lastSeen - _lsPrev > 3600000) { _lastSeenSaved.set(license, rec.lastSeen); ks.save(db); _persisted = true; } // persist at most hourly per license (mtime-cached load + this debounce = a re-validation flood costs ~0 scrypt/disk)
+  // ★RANK-2 (2026-08-15): flag a probable MachineGuid CLONE by IP fan-out — the one clone vector the client hwid lock can't
+  // catch (every clone presents the same bound hwid, so the `rec.hwid !== hwid` check above passes for all copies). FLAG
+  // ONLY, never deny: a legit roaming/mobile/VPN seat also spans IPs, so the operator reviews flagged keys (visible in
+  // /api/keys + key-audit.log) and revokes a confirmed share. req.ip is the real client IP (trust proxy: 1).
+  try {
+    const ip = String(req.ip || '').slice(0, 45);
+    const { distinct } = ks.recordValidationIp(rec, ip, rec.lastSeen, {}); // ipLog mutates the in-memory (cache-by-ref) record → clone detection stays current WITHOUT a per-request encrypted save
+    const FLAG_IPS = 6; // one honest seat is ~1 IP; ≥6 distinct in 24h is a strong clone/share signal (tunable)
+    if (distinct >= FLAG_IPS) {
+      const _wasFlagged = rec.flagged && rec.flagged.reason === 'multi-ip';
+      rec.flagged = { reason: 'multi-ip', ips: distinct, at: rec.lastSeen }; // refresh the count in-memory (cheap); the hourly save flushes it durably
+      // ★2026-08-15 DoS fix (adversary #1): persist + audit ONCE, only on the FIRST raise — NEVER per new IP. Every encrypted
+      // ks.save() runs scryptSync (CPU-hard, blocks the event loop), so saving per-IP let a bound key POSTing from >50
+      // rotating IPs pin the server. The flag count still refreshes in-memory each request; the hourly debounce flushes it.
+      if (!_wasFlagged) { try { ks.audit('flag', license, 'multi-ip fan-out=' + distinct + ' in 24h (possible MachineGuid clone) — review + suspend/revoke if shared'); } catch {} _lastSeenSaved.set(license, rec.lastSeen); ks.save(db); }
+    }
+  } catch (e) { try { console.error('ip-track:', e.message); } catch {} }
   return res.json(grant());
 });
 
@@ -337,4 +377,5 @@ app.get('/api/keys', rateLimiter({ windowMs: 60000, max: 20, name: 'keys' }), ad
 
 const PORT = process.env.PORT || 3509;
 if (!ks.isEncryptedAtRest()) console.warn('⚠️  KEYS_ENCRYPTION_KEY is not set — the key store is stored in PLAINTEXT. Set it to encrypt keys.json at rest (see DEPLOY-COOLIFY.md).');
+if (process.env.MIN_CLIENT_VERSION) console.warn('⚠️  VERSION GATE ACTIVE: MIN_CLIENT_VERSION=' + process.env.MIN_CLIENT_VERSION + ' — EVERY client reporting a lower version is denied at its next check (no offline grace). Ensure this is ≤ the version you have actually shipped, or the whole fleet locks out.');
 app.listen(PORT, '0.0.0.0', () => console.log('Za Post license server listening on :' + PORT + (ks.isEncryptedAtRest() ? ' (key store encrypted)' : '')));
