@@ -81,9 +81,9 @@ for (const m of mapping) {
   console.log(`    NEW  ${m.newKey}   tier=${m.tier}  expires=${m.expires ? new Date(m.expires).toISOString().slice(0, 10) : 'never'}`);
 }
 console.log('\nNext steps — per client, IN THIS ORDER (no downtime):');
-console.log('  1. Send the client their NEW key + the 1.0.271 zip over a SECURE channel.');
-console.log('  2. They install 1.0.271 and activate → the new key binds to their machine.');
-console.log('  3. Confirm:  node list-keys.js    (their NEW key shows bound + v1.0.271)');
+console.log('  1. Send the client their NEW key + the LATEST app zip you built for them over a SECURE channel.');
+console.log('  2. They install it and activate → the new key binds to their machine.');
+console.log('  3. Confirm:  node list-keys.js    (their NEW key shows bound + the new version)');
 console.log('  4. THEN revoke the OLD key:');
 for (const m of mapping) console.log(`       node revoke.js ${m.oldKey}`);
 if (dryRun) console.log('\n(Re-run without --dry-run to actually mint the new keys.)');
