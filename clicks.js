@@ -16,16 +16,22 @@ function _ensureDir() { try { fs.mkdirSync(path.dirname(FILE), { recursive: true
 // acceptable; a licensing outage is not). Stat at most once/30s so the hot redirect path stays cheap. Prune/rotate the file
 // (or raise CLICKS_MAX_BYTES) to resume counting.
 const MAX_BYTES = Number(process.env.CLICKS_MAX_BYTES) || 50 * 1024 * 1024; // 50 MB default
-let _lastSizeCheck = 0, _overCap = false;
+let _lastSizeCheck = 0, _overCap = false, _bytesSinceCheck = 0;
 
 // Fire-and-forget: a logging failure must NEVER break the redirect the human is waiting on.
 function logClick(rec) {
   try {
     _ensureDir();
     const now = Date.now();
-    if (now - _lastSizeCheck > 30000) { _lastSizeCheck = now; let over = false; try { over = fs.statSync(FILE).size >= MAX_BYTES; } catch {} if (over && !_overCap) { try { console.warn(`[clicks] ${FILE} reached ${MAX_BYTES} bytes — DROPPING new clicks to protect the /data volume (licensing). Prune/rotate the file or raise CLICKS_MAX_BYTES.`); } catch {} } _overCap = over; }
+    const _line = JSON.stringify(rec) + '\n';
+    // ★2026-08-16: don't rely on the 30s timer ALONE. The per-IP limiters are evaded by a DISTRIBUTED flood, so in the up-to-
+    // 30s window after the file first crosses MAX_BYTES the old code appended unconditionally — overshooting by (aggregate
+    // throughput × 30s), potentially exhausting the shared /data volume (a LICENSING outage, not just lost analytics). Also
+    // force a re-stat once ~5MB has been appended since the last check → bounds the overshoot to that, regardless of the window.
+    _bytesSinceCheck += _line.length;
+    if (now - _lastSizeCheck > 30000 || _bytesSinceCheck > 5 * 1024 * 1024) { _lastSizeCheck = now; _bytesSinceCheck = 0; let over = false; try { over = fs.statSync(FILE).size >= MAX_BYTES; } catch {} if (over && !_overCap) { try { console.warn(`[clicks] ${FILE} reached ${MAX_BYTES} bytes — DROPPING new clicks to protect the /data volume (licensing). Prune/rotate the file or raise CLICKS_MAX_BYTES.`); } catch {} } _overCap = over; }
     if (_overCap) return; // over the cap → drop this click so the shared volume can't fill (licensing stays up)
-    fs.appendFile(FILE, JSON.stringify(rec) + '\n', () => {});
+    fs.appendFile(FILE, _line, () => {});
   } catch {}
 }
 

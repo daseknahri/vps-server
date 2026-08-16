@@ -18,8 +18,8 @@ function isEncryptedAtRest() { return !!encKey(); }
 // read, so a revocation/new-key is NEVER served stale. save() refreshes the cache to exactly what it wrote. The cache holds the
 // LIVE object by reference, so an in-place mutation (bind/lastSeen) is reflected without a re-read — correct because THIS server
 // is the store's primary writer, and any writer that ISN'T this process changes the mtime.
-let _cache = null, _cacheMtime = -1, _cacheFile = '';
-function _invalidate() { _cache = null; _cacheMtime = -1; _cacheFile = ''; }
+let _cache = null, _cacheMtime = -1, _cacheFile = '', _cacheSize = -1, _cacheIno = -1;
+function _invalidate() { _cache = null; _cacheMtime = -1; _cacheFile = ''; _cacheSize = -1; _cacheIno = -1; }
 // Load the store. Returns {} only when the file does not exist yet (first run). A parse/decrypt
 // failure THROWS — we must never silently treat a corrupt/wrong-key store as empty and overwrite it.
 function load() {
@@ -27,7 +27,11 @@ function load() {
   let st;
   try { st = fs.statSync(file); }
   catch (e) { if (e && e.code === 'ENOENT') { _invalidate(); return {}; } throw e; }
-  if (_cache && _cacheFile === file && _cacheMtime === st.mtimeMs) return _cache;
+  // ★2026-08-16: key the cache on mtime AND size AND inode, not mtime alone. On a coarse-mtime volume (some network/overlay
+  // drivers, ≥1s granularity) an external admin write (revoke/suspend/extend — each an atomic rename → NEW inode) can land in
+  // the SAME mtime tick as the server's last save; keying on mtime alone would serve the STALE record and miss the revoke —
+  // worse, the server would then re-persist the stale copy over it. size+ino perturb on any real external write → re-read.
+  if (_cache && _cacheFile === file && _cacheMtime === st.mtimeMs && _cacheSize === st.size && _cacheIno === st.ino) return _cache;
   let txt;
   try { txt = fs.readFileSync(file, 'utf8'); }
   catch (e) { if (e && e.code === 'ENOENT') { _invalidate(); return {}; } throw e; }
@@ -37,7 +41,7 @@ function load() {
     if (!encKey()) throw new Error('keys store is encrypted but KEYS_ENCRYPTION_KEY is not set');
     db = kc.decrypt(raw, encKey());
   } else db = (raw && typeof raw === 'object') ? raw : {};
-  _cache = db; _cacheMtime = st.mtimeMs; _cacheFile = file;
+  _cache = db; _cacheMtime = st.mtimeMs; _cacheFile = file; _cacheSize = st.size; _cacheIno = st.ino;
   return db;
 }
 
@@ -55,7 +59,7 @@ function save(db) {
   } catch (e) { try { fs.unlinkSync(tmp); } catch {} throw e; } // clean up our own temp on a failed write (unique name would otherwise orphan)
   // Refresh the load() cache to exactly what we just wrote → the next load() skips a re-read + scryptSync-decrypt (F1). On a
   // stat failure INVALIDATE (never keep a stale cache) so the next load() re-reads from disk.
-  try { _cache = db; _cacheMtime = fs.statSync(file).mtimeMs; _cacheFile = file; } catch { _invalidate(); }
+  try { const _st = fs.statSync(file); _cache = db; _cacheMtime = _st.mtimeMs; _cacheFile = file; _cacheSize = _st.size; _cacheIno = _st.ino; } catch { _invalidate(); }
 }
 
 function auditPath() { return path.join(path.dirname(keysPath()), 'key-audit.log'); }

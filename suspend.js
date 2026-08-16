@@ -28,4 +28,4 @@ try { ks.save(db); ks.audit(lift ? 'unsuspend' : 'suspend', key, reason); }
 catch (e) { console.error('Could not write the key store:', e.message); process.exit(1); }
 
 console.log(key, '->', db[key].suspended ? 'SUSPENDED' : 'active', db[key].suspendMessage ? '("' + db[key].suspendMessage + '")' : '');
-if (db[key].suspended) console.log('ℹ️  Denied at the seat\'s next ONLINE check (it runs offline until its grace expires, same as revoke). Reinstate anytime with --lift — the binding is preserved, so it activates instantly.');
+if (db[key].suspended) console.log('ℹ️  Denied at the seat\'s next ONLINE check. On UPDATED clients this WIPES the cached token (a hard kill, same as revoke) so it cannot ride offline grace; OLDER clients deny online but can still run offline until grace expires — use revoke.js to hard-kill a confirmed share now. Reinstate anytime with --lift — the binding is preserved, so it re-activates on the next online check.');

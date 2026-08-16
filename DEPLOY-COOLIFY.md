@@ -41,6 +41,16 @@ anyway, since it holds your sellable app source.
   - **Name:** `license-data`
   - **Mount Path:** `/data`
 - This makes `/data/keys.json` survive redeploys.
+- **⚠️ The server now REFUSES to boot** if `/data` is empty AND not a real mounted volume (it would otherwise silently
+  seed an owner-only store, accept customer activations, then lose every key + HWID bind on the next redeploy —
+  unrecoverable, because `reset-keys` backups live on the same lost volume). If you see
+  `FATAL: key store dir "/data" is EMPTY and on the CONTAINER ROOT filesystem`, the volume isn't mounted — fix the mount
+  above. On a genuine first install, set `ALLOW_EMPTY_KEYSTORE=1` for ONE deploy to seed the owner key, then remove it.
+- **⚠️ Keep this resource at ONE replica** (do not enable horizontal scaling / multiple instances). The key store is a
+  single-writer, mtime-cached file; two replicas split the in-memory clone-detection (RANK-2 IP fan-out) state so a
+  shared key is never flagged, and a `keys.json` write-write race (last-writer-wins on the atomic rename) can silently
+  drop a `revoke`/`suspend`. If you ever truly need >1 instance, front the key store with a real DB or an advisory lock
+  first.
 
 ## Step 5 — Environment variables
 - **`LICENSE_SIGNING_KEY`** = base64 of the PKCS8 PEM private key (from `node gen-signing-key.js`).

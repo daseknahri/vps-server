@@ -98,11 +98,28 @@ function loadSigningKey() {
     console.error('  The PUBLIC half must match LICENSE_PUBKEY compiled into the client, or nobody can activate.\n');
     process.exit(1);
   }
+  let k;
+  try { k = crypto.createPrivateKey(pem); }
+  catch (e) { console.error('\nFATAL: licence signing key is unreadable: ' + e.message + '\n'); process.exit(1); }
+  // ★2026-08-16: assert this is the ONE key the shipped clients pin (LICENSE_PUBKEY). createPrivateKey only proves the value
+  // is a readable Ed25519 key — NOT that it is the RIGHT one. A rotated / mis-pasted key boots green and mints grants signed
+  // by the wrong key; every already-shipped client rejects them as unsigned → the whole paying fleet drifts into offline-grace
+  // lockout within 7 days, with ZERO server-side error. Fail LOUD on mismatch (like the missing-key guard above) so a bad
+  // rotation FAILS the deploy + rolls back instead of silently bricking. For a DELIBERATE key rotation, ship a client build
+  // carrying the new public half FIRST, then set the LICENSE_PUBKEY env here to match.
+  const EXPECT_PUB = String(process.env.LICENSE_PUBKEY || '-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAQQ9h0QKdPXyQrD8Nr/49YbxRufo/vo8/Jx0kymUWqm8=\n-----END PUBLIC KEY-----').replace(/\r/g, '').trim();
   try {
-    const k = crypto.createPrivateKey(pem);
-    console.log('licence signing key loaded from ' + how);
-    return k;
-  } catch (e) { console.error('\nFATAL: licence signing key is unreadable: ' + e.message + '\n'); process.exit(1); }
+    const gotPub = crypto.createPublicKey(k).export({ type: 'spki', format: 'pem' }).replace(/\r/g, '').trim();
+    if (EXPECT_PUB && gotPub !== EXPECT_PUB) {
+      console.error('\nFATAL: the licence signing key does NOT match the public key compiled into shipped clients.');
+      console.error('  Grants signed by this key are REJECTED by every client as unsigned → fleet lockout within the 7-day grace.');
+      console.error('  Almost always a mis-paste or an un-coordinated key rotation. Restore the correct LICENSE_SIGNING_KEY,');
+      console.error('  or — for a DELIBERATE rotation — ship a client with the new LICENSE_PUBKEY first, then set the LICENSE_PUBKEY env here.\n');
+      process.exit(1);
+    }
+  } catch (e) { console.error('WARNING: could not derive the signing key public half to verify it: ' + (e && e.message)); }
+  console.log('licence signing key loaded from ' + how + ' (public half matches the shipped client)');
+  return k;
 }
 const SIGNING_KEY = loadSigningKey();
 
@@ -155,6 +172,33 @@ function adminAuth(req, res, next) {
   next();
 }
 
+// ★2026-08-16 (BRICK): guard against an UNMOUNTED persistent volume. Persistence depends 100% on Coolify mounting a volume
+// at KEYS_PATH's dir (/data). If that mount is missing or the path is typo'd, /data is an EPHEMERAL container-layer dir: the
+// store loads empty, we seed owner-only + accept customer activations, and the FIRST redeploy wipes every key + HWID bind —
+// unrecoverable (reset-keys backups live on the same lost volume; the owner's OWN app silently re-seeds + re-binds, so a
+// smoke test still passes while the whole fleet is down). Detect it: an EMPTY store whose dir shares the container-ROOT
+// device (or whose dir does not even exist) is a volume that isn't mounted → refuse to boot (loud → Coolify rolls back),
+// unless this is a deliberate first install (ALLOW_EMPTY_KEYSTORE=1). A real mounted volume has its OWN st_dev → never trips.
+// Linux-container-only: a local dev run (Windows, or without KEYS_PATH) is exempt.
+try {
+  if (process.platform !== 'win32' && String(process.env.KEYS_PATH || '').trim() && !String(process.env.ALLOW_EMPTY_KEYSTORE || '').trim()) {
+    let _empty = false; try { _empty = Object.keys(ks.load()).length === 0; } catch {}
+    if (_empty) {
+      const _dir = path.dirname(String(process.env.KEYS_PATH));
+      let _unmounted = false;
+      try { _unmounted = fs.statSync(_dir).dev === fs.statSync('/').dev; }
+      catch (e) { if (e && e.code === 'ENOENT') _unmounted = true; } // the volume dir does not even exist → definitely not mounted
+      if (_unmounted) {
+        console.error('\nFATAL: key store dir ' + JSON.stringify(_dir) + ' is EMPTY and on the CONTAINER ROOT filesystem, not a mounted persistent volume.');
+        console.error('  Every activation would be LOST on the next redeploy (customer keys + HWID binds — unrecoverable).');
+        console.error('  Fix: in Coolify, add persistent storage mounted at ' + JSON.stringify(_dir) + ', Save, Redeploy.');
+        console.error('  If this really is a fresh first install on a correctly-mounted volume, set ALLOW_EMPTY_KEYSTORE=1 for ONE deploy, then remove it.\n');
+        process.exit(1);
+      }
+    }
+  }
+} catch {}
+
 // Seed the owner key from an env var so the secret never lives in Git. Added once if missing.
 try {
   const ownerKey = String(process.env.OWNER_KEY || '').trim().toUpperCase();
@@ -168,7 +212,12 @@ try {
   }
 } catch (e) { console.error('owner seed:', e.message); }
 
-app.get('/health', (_req, res) => res.status(200).json({ ok: true }));
+// ★2026-08-16: readiness, not just liveness. The Docker HEALTHCHECK hits this; if it never touched the key store, a
+// keystore-UNREADABLE state (KEYS_ENCRYPTION_KEY rotated/removed, or a CLI re-encrypted the store with a divergent key →
+// ks.load() throws → every /api/validate 503s) would stay GREEN, so Coolify keeps the broken container live + never rolls
+// back, and the whole fleet drifts into grace lockout while the dashboard shows healthy. Probe ks.load() so a store the
+// running key can't decrypt FAILS the deploy → rollback. ENOENT (genuine first boot) returns {} — not a throw → stays healthy.
+app.get('/health', (_req, res) => { try { ks.load(); return res.status(200).json({ ok: true }); } catch (e) { try { console.error('health: key store unreadable:', e && e.message); } catch {} return res.status(503).json({ ok: false, error: 'key store unavailable' }); } });
 
 // ── CLICK TRACKING (per-group / per-account) ─────────────────────────────────────────────────────────────────────────
 // The desktop app posts links like  https://<this-host>/r?g=<groupId>&a=<account>&p=<postId>  into Facebook groups.
@@ -301,7 +350,7 @@ const _lastSeenSaved = new Map();
 // enforces (per-seat model).
 app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validate' }), (req, res) => {
   const license = String((req.body && req.body.license) || '').trim().toUpperCase();
-  const hwid = String((req.body && req.body.hwid) || '').trim();
+  const hwid = String((req.body && req.body.hwid) || '').replace(/[^\x20-\x7E]/g, '').trim().slice(0, 128); // ★2026-08-16: strip non-printable/ANSI + cap length — mirror the `ver` sanitize below (rec.hwid renders RAW in list-keys.js, so a control/ESC-injected hwid could CONCEAL a ⚠️ clone flag in the operator's terminal). node-machine-id's real id is sha256-hex/GUID/hostname — all printable ASCII — so a legit seat is untouched (no device-lock regression); an all-ANSI hwid strips to '' and is rejected by the length gate below.
   const ver = String((req.body && req.body.ver) || '').replace(/[^0-9.a-z-]/gi, '').slice(0, 24); // client app version — telemetry + the version gate. STRIP to version chars (adversary #2): ver is rendered RAW in list-keys.js, so control/ANSI chars could hide a CLONE flag in the operator's terminal. ('' from an older client → grandfathered)
   const acc = Math.max(0, Math.min(99999, Number((req.body && req.body.acc)) || 0)); // reported account count — telemetry only
   const grp = Math.max(0, Math.min(99999, Number((req.body && req.body.grp)) || 0)); // reported group count — telemetry only
