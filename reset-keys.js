@@ -7,6 +7,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const kc = require('./crypto');
 const ks = require('./keystore');
 const TIERS = new Set(['trial', 'standard', 'pro', 'owner']);
 
@@ -28,7 +29,10 @@ try { db = ks.load(); } catch (e) { console.error('Could not read the key store:
 // Back up FIRST — a plaintext snapshot so a mistake is reversible. Abort (delete nothing) if the backup can't be written.
 const stamp = new Date().toISOString().replace(/[:.]/g, '-');
 const bak = path.join(path.dirname(ks.keysPath()), 'keys.backup-' + stamp + '.json');
-try { fs.writeFileSync(bak, JSON.stringify(db, null, 2)); }
+// ★2026-08-16: MATCH the store's at-rest encryption so we never drop a plaintext key dump next to an encrypted keys.json
+// (an encrypted backup restores fine — load() auto-detects __enc__). Unencrypted store → unchanged plaintext snapshot.
+const bakBlob = ks.isEncryptedAtRest() ? kc.encrypt(db, process.env.KEYS_ENCRYPTION_KEY) : db;
+try { fs.writeFileSync(bak, JSON.stringify(bakBlob, null, 2)); }
 catch (e) { console.error('Could not write the backup — ABORTING, nothing deleted:', e.message); process.exit(1); }
 
 // Delete every NON-owner key.
@@ -51,3 +55,7 @@ console.log('Deleted ' + deleted + ' non-owner key(s). Issued ' + issued.length 
 for (const [note, key] of issued) console.log('  ' + String(note || '(unnamed)').padEnd(24) + '  →  ' + key);
 console.log('\nSend each client THEIR key. It is UNBOUND → it binds to their machine on first launch.');
 console.log('⚠️  Do NOT launch a client key on your own PC (that binds it to you — use reset-hwid.js if you do).');
+console.log('⚠️  DELETING a key here does NOT immediately kill an already-activated seat: a deleted key returns a plain "invalid"');
+console.log('    that does not wipe the client cache, so that machine can keep running OFFLINE on its cached token for up to its');
+console.log('    7-day grace. To KILL a seat NOW, REVOKE it first (node revoke.js <KEY>) — revoke wipes the client cache on its');
+console.log('    next online check — then delete it here if you want it gone.');

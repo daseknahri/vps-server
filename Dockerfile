@@ -10,6 +10,9 @@ COPY . .
 # Keys live on a PERSISTENT volume so they survive redeploys (mount a volume at /data).
 ENV KEYS_PATH=/data/keys.json
 ENV PORT=3509
+ENV NODE_ENV=production
+# ★2026-08-16: production mode so Express's default error handler does NOT put err.stack in the response body (with it
+# unset, an unauthenticated /api/validate 500 leaked file paths + internals). Paired with the explicit handler in license-server.js.
 EXPOSE 3509
 # Probe the no-auth /health route on the local port. start-period gives the server time to boot so
 # early "connection refused" attempts don't count as failures.

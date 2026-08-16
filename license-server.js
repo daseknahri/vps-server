@@ -305,6 +305,7 @@ app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validat
   const ver = String((req.body && req.body.ver) || '').replace(/[^0-9.a-z-]/gi, '').slice(0, 24); // client app version — telemetry + the version gate. STRIP to version chars (adversary #2): ver is rendered RAW in list-keys.js, so control/ANSI chars could hide a CLONE flag in the operator's terminal. ('' from an older client → grandfathered)
   const acc = Math.max(0, Math.min(99999, Number((req.body && req.body.acc)) || 0)); // reported account count — telemetry only
   const grp = Math.max(0, Math.min(99999, Number((req.body && req.body.grp)) || 0)); // reported group count — telemetry only
+  const brand = String((req.body && req.body.brand) || ''); // reported brand-app name — telemetry only; recordAppTelemetry sanitizes it HARD (strips to [a-z0-9-], caps length, rejects proto names). ★2026-08-16: this was UNDECLARED at line ~348 → ReferenceError on every re-validation → 500 → offline-grace lockout. Declared here + the tail is now try-wrapped so telemetry can never break the grant.
   // round-4: reject an empty/short hwid up front. An empty hwid binds FALSY (rec.hwid='' → never actually locks, so any
   // machine re-binds it) AND skips the "already active on another device" check below → a known key can be squatted/pre-bound
   // by anyone who learns the string, locking out the real buyer. The legit client never POSTs a null/short id (a real
@@ -336,7 +337,7 @@ app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validat
     // key store did not actually bind.
     ...signGrant({ license, hwid: rec.hwid || hwid, tier: rec.tier, expires: rec.expires, nonce }),
   });
-  if (rec.hwid == null) { rec.hwid = hwid; rec.activatedAt = Date.now(); ks.save(db); ks.audit('bind', license, 'hwid=' + hwid.slice(0, 8)); return res.json({ ...grant(), message: 'Activated' }); } // == null (not !rec.hwid): a genuinely UNBOUND record is null (gen-key / reset-hwid); a hand-edited/legacy '' hwid must NOT be treated as bindable-by-anyone — it falls to the strict compare below and is rejected as "already active on another device" (fail closed). New binds always write a ≥8-char id (front-door gate), so real records are never '' → no legit impact.
+  if (rec.hwid == null) { rec.hwid = hwid; rec.activatedAt = Date.now(); try { if (ver) rec.lastVersion = ver; if (!ks.recordAppTelemetry(rec, brand, { ver, acc, grp }, Date.now())) { if (acc) rec.lastAccounts = acc; if (grp) rec.lastGroups = grp; } } catch {} /* ★2026-08-16 F2: record telemetry on FIRST activation too, else a fresh key shows no ver/acc/grp until its first hourly re-validation */ ks.save(db); ks.audit('bind', license, 'hwid=' + hwid.slice(0, 8)); return res.json({ ...grant(), message: 'Activated' }); } // == null (not !rec.hwid): a genuinely UNBOUND record is null (gen-key / reset-hwid); a hand-edited/legacy '' hwid must NOT be treated as bindable-by-anyone — it falls to the strict compare below and is rejected as "already active on another device" (fail closed). New binds always write a ≥8-char id (front-door gate), so real records are never '' → no legit impact.
   if (hwid && rec.hwid !== hwid) return res.json({ valid: false, message: 'License is already active on another device' });
   rec.lastSeen = Date.now(); // always current in the in-memory (cached) store
   // ★2026-08-15 telemetry — PER-BRAND so ONE client running all 4 brand-apps (same key + hwid, separate userData each,
@@ -344,12 +345,12 @@ app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validat
   // client-controlled and becomes an object key → sanitize HARD: strip to [a-z0-9-] (removes the underscores in __proto__),
   // cap length, and reject the prototype-pollution names. Prune brands not seen in 14 days so a client that stopped running
   // one app doesn't inflate the total forever. Bounded (a handful of brands per key). list-keys.js sums rec.apps.
+  try { // ★2026-08-16 OUTER GUARD: wrap the ENTIRE telemetry + clone-detection tail so a field/type error can NEVER 500 the license gate. (brand was undeclared here → ReferenceError on every re-validation → clients fell to offline grace → seats locked out ~7 days after activation.) On error: log + fall through to the grant; the seat stays valid, only this request's telemetry/flag update is skipped.
   if (ver) rec.lastVersion = ver; // keep the most-recent version at top level (backward-compat + display)
   const _sb = ks.recordAppTelemetry(rec, brand, { ver, acc, grp }, rec.lastSeen); // per-brand aggregate → combined per-client total (list-keys.js sums rec.apps)
   if (!_sb) { if (acc) rec.lastAccounts = acc; if (grp) rec.lastGroups = grp; } // no brand (older client) → flat single-app telemetry
   const _lsPrev = _lastSeenSaved.get(license) || 0;
-  let _persisted = false;
-  if (rec.lastSeen - _lsPrev > 3600000) { _lastSeenSaved.set(license, rec.lastSeen); ks.save(db); _persisted = true; } // persist at most hourly per license (mtime-cached load + this debounce = a re-validation flood costs ~0 scrypt/disk)
+  if (rec.lastSeen - _lsPrev > 3600000) { _lastSeenSaved.set(license, rec.lastSeen); ks.save(db); } // persist at most hourly per license (mtime-cached load + this debounce = a re-validation flood costs ~0 scrypt/disk)
   // ★RANK-2 (2026-08-15): flag a probable MachineGuid CLONE by IP fan-out — the one clone vector the client hwid lock can't
   // catch (every clone presents the same bound hwid, so the `rec.hwid !== hwid` check above passes for all copies). FLAG
   // ONLY, never deny: a legit roaming/mobile/VPN seat also spans IPs, so the operator reviews flagged keys (visible in
@@ -367,6 +368,7 @@ app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validat
       if (!_wasFlagged) { try { ks.audit('flag', license, 'multi-ip fan-out=' + distinct + ' in 24h (possible MachineGuid clone) — review + suspend/revoke if shared'); } catch {} _lastSeenSaved.set(license, rec.lastSeen); ks.save(db); }
     }
   } catch (e) { try { console.error('ip-track:', e.message); } catch {} }
+  } catch (e) { try { console.error('validate telemetry (non-fatal):', e && e.message); } catch {} } // ★2026-08-16 OUTER guard close: telemetry/persist/clone-flag can never break the grant
   return res.json(grant());
 });
 
@@ -378,4 +380,9 @@ app.get('/api/keys', rateLimiter({ windowMs: 60000, max: 20, name: 'keys' }), ad
 const PORT = process.env.PORT || 3509;
 if (!ks.isEncryptedAtRest()) console.warn('⚠️  KEYS_ENCRYPTION_KEY is not set — the key store is stored in PLAINTEXT. Set it to encrypt keys.json at rest (see DEPLOY-COOLIFY.md).');
 if (process.env.MIN_CLIENT_VERSION) console.warn('⚠️  VERSION GATE ACTIVE: MIN_CLIENT_VERSION=' + process.env.MIN_CLIENT_VERSION + ' — EVERY client reporting a lower version is denied at its next check (no offline grace). Ensure this is ≤ the version you have actually shipped, or the whole fleet locks out.');
+// ★2026-08-16: explicit error handler — any unhandled route throw returns a GENERIC 500 with no stack/message. With
+// NODE_ENV unset, Express's default handler put err.stack in the response body; on the unauthenticated /api/validate that
+// leaked file paths + internals. Defense-in-depth alongside the per-handler try/catch and NODE_ENV=production.
+app.use((err, _req, res, _next) => { try { console.error('unhandled:', err && err.message); } catch {} if (res.headersSent) return; try { res.status(500).json({ valid: false, message: 'Server error' }); } catch {} });
+
 app.listen(PORT, '0.0.0.0', () => console.log('Za Post license server listening on :' + PORT + (ks.isEncryptedAtRest() ? ' (key store encrypted)' : '')));

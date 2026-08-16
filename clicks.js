@@ -54,7 +54,8 @@ function aggregate(since) {
     if (g && a) { const k = g + '|' + a; byGroupAccount[k] = (byGroupAccount[k] || 0) + 1; }
     // Server-side pageview rows (the /log route, za-click-log mu-plugin): a Facebook-referred article view counted on the
     // WordPress SERVER — no g/a/p/c token, no on-page beacon, so it can't affect ad RPM. Count FB clicks per (blog, article).
-    const _pth = r.path != null ? String(r.path) : '';
+    // ★2026-08-16: strip ?fbclid (+ #fragment) before keying so every FB-referred view of one article buckets together — mirrors articleKey().
+    const _pth = r.path != null ? String(r.path).replace(/[?#].*$/, '') : '';
     if (b && _pth) { const k = b + ' ' + _pth; byArticle[k] = (byArticle[k] || 0) + 1; }
   }
   return { total, byGroup, byAccount, byGroupAccount, byPost, byCategory, byBlog, byArticle, since: since || null };
