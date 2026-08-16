@@ -345,6 +345,19 @@ app.get('/api/pageviews', rateLimiter({ windowMs: 60000, max: 60, name: 'pagevie
 // in-memory value (in the mtime-cached store) is always current. Not persisted across a restart — it rebuilds on the first
 // post-restart validate. license → last-persisted-ts.
 const _lastSeenSaved = new Map();
+// ★RANK-2b (2026-08-16): concurrency / second-machine thresholds (see keystore.recordDeviceConcurrency). FLAG-ONLY by default — a
+// flag is cosmetic (list-keys ⚠️), NEVER a denial, so it cannot brick a paying seat. FLAG_HWIDS: the bound machine AND ≥1 other
+// distinct hwid both heartbeating in the window ⇒ a real second box. RATE_HITS: one hwid validating far above a single seat's
+// ceiling (4 brand-apps × hourly ≈ 8 per 2h; generous restarts push higher) ⇒ many same-hwid clones behind one NAT — muddy, so
+// it sits well above any honest 4-brand rate. AUTO-SUSPEND is OFF unless CLONE_AUTOSUSPEND=1, gated on a HIGHER distinct-hwid bar,
+// and is REVERSIBLE (suspend.js --lift). HONEST: /api/validate is unauthenticated (key+hwid), so anyone holding the KEY string can
+// forge extra hwids to trip a flag (or, with auto-suspend on, a suspend) — that is exactly why auto-suspend defaults OFF and the
+// operator reviews the flag before acting.
+const CONC_WINDOW_MS = 2 * 3600 * 1000;
+const FLAG_HWIDS = 2;                                              // bound machine + ≥1 other distinct hwid active in the window
+const RATE_HITS = Number(process.env.CLONE_RATE_HITS) || 40;       // same-hwid validate count in the window that implies multiple concurrent instances (tunable; keep >> a 4-brand seat)
+const SUSPEND_HWIDS = Number(process.env.CLONE_SUSPEND_HWIDS) || 3; // auto-suspend bar (only when CLONE_AUTOSUSPEND=1)
+const CLONE_AUTOSUSPEND = String(process.env.CLONE_AUTOSUSPEND || '').trim() === '1';
 // Validate + bind a license to one machine (HWID). First activation binds; later launches must come
 // from the same machine. Revoked/expired keys are rejected. Returns the tier + limits the client
 // enforces (per-seat model).
@@ -386,8 +399,29 @@ app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validat
     // key store did not actually bind.
     ...signGrant({ license, hwid: rec.hwid || hwid, tier: rec.tier, expires: rec.expires, nonce }),
   });
-  if (rec.hwid == null) { rec.hwid = hwid; rec.activatedAt = Date.now(); try { if (ver) rec.lastVersion = ver; if (!ks.recordAppTelemetry(rec, brand, { ver, acc, grp }, Date.now())) { if (acc) rec.lastAccounts = acc; if (grp) rec.lastGroups = grp; } } catch {} /* ★2026-08-16 F2: record telemetry on FIRST activation too, else a fresh key shows no ver/acc/grp until its first hourly re-validation */ ks.save(db); ks.audit('bind', license, 'hwid=' + hwid.slice(0, 8)); return res.json({ ...grant(), message: 'Activated' }); } // == null (not !rec.hwid): a genuinely UNBOUND record is null (gen-key / reset-hwid); a hand-edited/legacy '' hwid must NOT be treated as bindable-by-anyone — it falls to the strict compare below and is rejected as "already active on another device" (fail closed). New binds always write a ≥8-char id (front-door gate), so real records are never '' → no legit impact.
-  if (hwid && rec.hwid !== hwid) return res.json({ valid: false, message: 'License is already active on another device' });
+  if (rec.hwid == null) { rec.hwid = hwid; rec.activatedAt = Date.now(); rec.hwidLog = [{ hwid, ts: Date.now(), n: 1 }]; /* ★RANK-2b: seed the concurrency log on a fresh bind / reset-hwid rebind so a stale pre-reset hwid can't instantly read as a second machine */ try { if (ver) rec.lastVersion = ver; if (!ks.recordAppTelemetry(rec, brand, { ver, acc, grp }, Date.now())) { if (acc) rec.lastAccounts = acc; if (grp) rec.lastGroups = grp; } } catch {} /* ★2026-08-16 F2: record telemetry on FIRST activation too, else a fresh key shows no ver/acc/grp until its first hourly re-validation */ ks.save(db); ks.audit('bind', license, 'hwid=' + hwid.slice(0, 8)); return res.json({ ...grant(), message: 'Activated' }); } // == null (not !rec.hwid): a genuinely UNBOUND record is null (gen-key / reset-hwid); a hand-edited/legacy '' hwid must NOT be treated as bindable-by-anyone — it falls to the strict compare below and is rejected as "already active on another device" (fail closed). New binds always write a ≥8-char id (front-door gate), so real records are never '' → no legit impact.
+  if (hwid && rec.hwid !== hwid) {
+    // ★RANK-2b (2026-08-16): a DIFFERENT hwid on a BOUND key is either the honest owner on a new PC (rare; handled by reset-hwid)
+    // or the key being run on a SECOND MACHINE. We STILL DENY (the bind-lock holds) but RECORD the attempt so a real second box —
+    // the bound machine AND this one both heartbeating in the window — surfaces as a clone FLAG (never a denial here). Wrapped so
+    // concurrency tracking can NEVER change the deny; lastSeen is NOT touched (this requester is not the seat).
+    try {
+      const { distinctHwids } = ks.recordDeviceConcurrency(rec, hwid, Date.now(), { windowMs: CONC_WINDOW_MS });
+      if (distinctHwids >= FLAG_HWIDS) {
+        const _wasFlagged = rec.flagged && rec.flagged.reason === 'multi-hwid';
+        rec.flagged = { reason: 'multi-hwid', hwids: distinctHwids, at: Date.now() }; // refresh in-memory (cheap); the save below flushes it durably
+        if (CLONE_AUTOSUSPEND && distinctHwids >= SUSPEND_HWIDS && !rec.suspended) {
+          rec.suspended = true; rec.suspendMessage = 'License suspended — key active on ' + distinctHwids + ' machines (auto). Contact support.';
+          try { ks.audit('suspend', license, 'AUTO multi-hwid=' + distinctHwids + ' (CLONE_AUTOSUSPEND) — REVERSIBLE with suspend.js --lift'); } catch {}
+          _lastSeenSaved.set(license, Date.now()); ks.save(db);
+        } else if (!_wasFlagged) { // persist + audit ONCE on the FIRST raise (mirror the multi-ip flag — never a scryptSync save per request)
+          try { ks.audit('flag', license, 'multi-hwid=' + distinctHwids + ' in ' + (CONC_WINDOW_MS / 3600000) + 'h (second machine — review + suspend/revoke if shared)'); } catch {}
+          _lastSeenSaved.set(license, Date.now()); ks.save(db);
+        }
+      }
+    } catch (e) { try { console.error('hwid-concurrency:', e.message); } catch {} }
+    return res.json({ valid: false, message: 'License is already active on another device' });
+  }
   rec.lastSeen = Date.now(); // always current in the in-memory (cached) store
   // ★2026-08-15 telemetry — PER-BRAND so ONE client running all 4 brand-apps (same key + hwid, separate userData each,
   // reporting on their own cycles) shows a COMBINED total instead of the apps overwriting each other's counts. `brand` is
@@ -417,6 +451,19 @@ app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validat
       if (!_wasFlagged) { try { ks.audit('flag', license, 'multi-ip fan-out=' + distinct + ' in 24h (possible MachineGuid clone) — review + suspend/revoke if shared'); } catch {} _lastSeenSaved.set(license, rec.lastSeen); ks.save(db); }
     }
   } catch (e) { try { console.error('ip-track:', e.message); } catch {} }
+  // ★RANK-2b (2026-08-16): same-hwid CONCURRENCY by validate RATE — the blind spot IP fan-out AND the bind-lock both miss: clones
+  // behind ONE NAT with a reg-cloned MachineGuid present the SAME ip AND the SAME bound hwid, so every copy is accepted right here.
+  // Their only tell is that N instances heartbeat → N× the validate rate one seat can produce. FLAG-ONLY (muddy: a heavy 4-brand
+  // user with frequent restarts climbs too), NEVER auto-suspend. hwid == rec.hwid on this path, so this also keeps the bound machine
+  // fresh in the log for the distinct-hwid check on the deny path.
+  try {
+    const { hits, distinctHwids } = ks.recordDeviceConcurrency(rec, hwid, rec.lastSeen, { windowMs: CONC_WINDOW_MS });
+    if (hits >= RATE_HITS && distinctHwids <= 1) { // distinctHwids>1 is already covered by the stronger multi-hwid flag on the deny path
+      const _wasFlagged = rec.flagged && rec.flagged.reason === 'multi-instance-rate';
+      rec.flagged = { reason: 'multi-instance-rate', hits, at: rec.lastSeen };
+      if (!_wasFlagged) { try { ks.audit('flag', license, 'multi-instance rate=' + hits + ' in ' + (CONC_WINDOW_MS / 3600000) + 'h (same-hwid clones behind one NAT? — review)'); } catch {} _lastSeenSaved.set(license, rec.lastSeen); ks.save(db); }
+    }
+  } catch (e) { try { console.error('hwid-rate:', e.message); } catch {} }
   } catch (e) { try { console.error('validate telemetry (non-fatal):', e && e.message); } catch {} } // ★2026-08-16 OUTER guard close: telemetry/persist/clone-flag can never break the grant
   return res.json(grant());
 });

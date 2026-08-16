@@ -87,6 +87,30 @@ function recordValidationIp(rec, ip, now, opts) {
   return { distinct: new Set(log.map((e) => e.ip)).size, isNew };
 }
 
+// ★RANK-2b (2026-08-16): server-side CONCURRENCY / second-machine detection. recordValidationIp (above) flags an IP FAN-OUT,
+// but that blind-spots the two worst clone shapes: copies behind ONE NAT (same req.ip → fan-out never climbs) and a reg-cloned
+// MachineGuid (same hwid → the `rec.hwid !== hwid` bind-check passes for every copy). This tracks recent (hwid, lastSeen) tuples
+// per key so the caller can flag a SECOND MACHINE two ways: >1 DISTINCT hwid actively heartbeating in a short window (the bound
+// machine AND another both checked in), or one hwid's validate RATE far above what a single seat can produce (many same-hwid
+// clones heartbeating behind one NAT). FALSE-POSITIVE GUARD: ONE customer runs up to 4 brand-apps on the SAME key+hwid
+// (recordAppTelemetry is per-brand) — every brand presents the SAME hwid, so a multi-brand seat is ALWAYS distinctHwids=1 and can
+// never be flagged. Only a genuinely different hwid, or an impossible rate, counts. PURE (mutates rec.hwidLog in place, no I/O) →
+// unit-tested. `n` is a per-window validate counter → a rate proxy without storing a tuple per request. Returns {distinctHwids,hits}.
+function recordDeviceConcurrency(rec, hwid, now, opts) {
+  opts = opts || {};
+  const windowMs = Number(opts.windowMs) || 2 * 3600 * 1000; // "actively heartbeating": ≥ the client's 1h re-validate so two continuously-running machines always overlap (tunable)
+  const maxLog = Number(opts.maxLog) || 16; // a real seat has 1 hwid; 16 tolerates a reset-hwid migration + churn while staying bounded
+  if (!rec || !hwid) return { distinctHwids: 0, hits: 0 };
+  let log = Array.isArray(rec.hwidLog) ? rec.hwidLog.filter((e) => e && e.hwid && (now - Number(e.ts) <= windowMs)) : [];
+  const cur = log.find((e) => e.hwid === hwid);
+  if (cur) { cur.ts = now; cur.n = (Number(cur.n) || 0) + 1; }
+  else log.push({ hwid: String(hwid), ts: now, n: 1 });
+  if (log.length > maxLog) { log.sort((a, b) => Number(a.ts) - Number(b.ts)); log = log.slice(-maxLog); } // current hwid has ts=now (newest) → always kept
+  rec.hwidLog = log;
+  let hits = 0; for (const e of log) hits += Number(e.n) || 0;
+  return { distinctHwids: log.length, hits };
+}
+
 // ★VERSION GATE (2026-08-15): compare two dotted numeric versions. Returns true iff a < b. Tolerant of missing parts +
 // non-numeric segments (treated as 0) and never throws — a garbled version string must never gate a legit client (the
 // caller only gates when BOTH the client version AND the required minimum are present + parse to real numbers).
@@ -134,4 +158,4 @@ function sumAppTelemetry(rec) {
   return { acc: Number(rec.lastAccounts) || 0, grp: Number(rec.lastGroups) || 0, apps: 0 };
 }
 
-module.exports = { load, save, audit, keysPath, isEncryptedAtRest, recordValidationIp, semverLt, recordAppTelemetry, sumAppTelemetry };
+module.exports = { load, save, audit, keysPath, isEncryptedAtRest, recordValidationIp, recordDeviceConcurrency, semverLt, recordAppTelemetry, sumAppTelemetry };
