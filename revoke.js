@@ -23,3 +23,9 @@ try { ks.save(db); ks.audit(restore ? 'restore' : 'revoke', key, unbind ? 'unbin
 catch (e) { console.error('Could not write the key store:', e.message); process.exit(1); }
 
 console.log(key, '->', db[key].revoked ? 'REVOKED' : 'active', db[key].hwid ? '(bound)' : '(unbound)');
+// REVOKE is the KILL SWITCH: on the seat's next ONLINE check (launch / hourly re-validate) the client sees `revoked`, DELETES its
+// cached licence, and locks immediately — so it can't come back. Prefer this to DELETING the key (reset-keys.js): a deleted key
+// returns a plain "invalid" that does NOT wipe the client cache, so an already-activated machine can keep running OFFLINE on its
+// cached signed token until its 7-day grace runs out. Neither can kill a CURRENTLY-offline machine instantly (offline grace is
+// inherent) — revoke ends it the moment that machine next touches the internet.
+if (!db[key].revoked) console.log('ℹ️  (un-revoked. To KILL a seat, revoke it — that wipes the client cache on its next online check; deleting the key alone leaves a ~7-day offline tail.)');

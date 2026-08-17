@@ -18,7 +18,7 @@ for (const k of keys.sort()) {
   const isExpired = r.expires && r.expires < now;
   if (r.revoked) revoked++; else if (isExpired) expired++; else active++;
   if (!r.hwid) unbound++;
-  const _flag = r.flagged && /^(multi-ip|multi-hwid|multi-instance-rate)$/.test(r.flagged.reason); if (_flag) flagged++; // ★RANK-2/2b: server-side clone signals (IP fan-out, second-machine hwid, same-hwid rate)
+  const _flag = r.flagged && /^(multi-ip|multi-hwid|multi-instance-rate|seat-mismatch)$/.test(r.flagged.reason); if (_flag) flagged++; // ★RANK-2/2b: clone signals (IP fan-out, 2nd-machine hwid, same-hwid rate); ★LEAK-TRACE: seat-mismatch (leaked build)
   if (r.suspended) suspended++; // ★2026-08-15: operator-suspended seat
   const exp = r.expires ? (isExpired ? 'EXPIRED ' + day(r.expires) : 'expires ' + day(r.expires)) : 'no expiry';
   // ★telemetry: SUM accounts + groups across the client's brand-apps (rec.apps) → the COMBINED per-client total; fall back
@@ -31,8 +31,11 @@ for (const k of keys.sort()) {
     + ' | ' + (r.hwid ? 'bound(' + String(r.hwid).slice(0, 10) + '…)' : 'UNBOUND        ')
     + ' | ' + exp
     + tele
+    + (r.seatClient ? '  | seat:' + r.seatClient : '')
     + (r.note ? '  | ' + r.note : '')
-    + (_flag ? '  | ⚠️ CLONE? ' + (r.flagged.reason === 'multi-ip' ? r.flagged.ips + ' IPs/24h' : r.flagged.reason === 'multi-hwid' ? r.flagged.hwids + ' machines' : 'rate ' + r.flagged.hits) + ' — review, then suspend.js/revoke.js if shared' : ''));
+    + (_flag ? (r.flagged.reason === 'seat-mismatch'
+        ? '  | ⚠️ LEAKED BUILD? seat=' + r.flagged.got + ' but bound to ' + r.flagged.expected + ' — a build issued to a different customer; review, then suspend.js/revoke.js'
+        : '  | ⚠️ CLONE? ' + (r.flagged.reason === 'multi-ip' ? r.flagged.ips + ' IPs/24h' : r.flagged.reason === 'multi-hwid' ? r.flagged.hwids + ' machines' : 'rate ' + r.flagged.hits) + ' — review, then suspend.js/revoke.js if shared') : ''));
 }
 console.log('\nsummary: ' + active + ' active, ' + expired + ' expired, ' + revoked + ' revoked'
   + (suspended ? ', ' + suspended + ' suspended' : '') + ' | ' + unbound + ' unbound (free to activate on a new machine)'

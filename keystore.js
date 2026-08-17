@@ -45,8 +45,29 @@ function load() {
   return db;
 }
 
-function save(db) {
+function save(db, opts) {
   const file = keysPath();
+  // ★#8 CROSS-PROCESS CAS (opt-in — DORMANT unless a caller passes {cas:true}; a plain save(db) is byte-for-byte the old
+  // behavior). Closes the load→mutate→save lost-update race between THIS server process and a `docker exec` admin script
+  // (revoke/gen-key/…) sharing KEYS_PATH: before we overwrite, confirm the on-disk file is still the exact version load()
+  // read (identity captured in the F1 cache). If it changed, an external writer committed since our load → THROW
+  // (KEYSTORE_CONFLICT) rather than clobber it. On the Linux deployment every save is a fresh-inode temp+rename, so `ino`
+  // perturbs on EVERY external write (mtime can be coarse and an encrypted/flag write can keep the same byte length).
+  // FAIL-SAFE: if the file exists but we have NO known cached identity (e.g. a prior save's post-write stat failed and
+  // invalidated the cache), we THROW rather than proceed — never a blind clobber. (Do NOT move KEYS_PATH onto NFS: its
+  // attribute caching can return stale mtime/size/ino and defeat this stat-based CAS.)
+  if (opts && opts.cas) {
+    let cur = null;
+    try { cur = fs.statSync(file); } catch (e) { if (!(e && e.code === 'ENOENT')) throw e; }
+    if (cur) {
+      const known = _cache !== null && _cacheFile === file && _cacheMtime >= 0;
+      if (!known || _cacheMtime !== cur.mtimeMs || _cacheSize !== cur.size || _cacheIno !== cur.ino) {
+        const err = new Error('KEYSTORE_CONFLICT: keys store changed on disk since load — refusing to clobber a concurrent write');
+        err.code = 'KEYSTORE_CONFLICT';
+        throw err;
+      }
+    }
+  }
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const out = encKey() ? kc.encrypt(db, encKey()) : db;
   // Atomic-ish: write a temp file then rename so a crash mid-write can't truncate the store. PER-WRITER temp name
@@ -60,6 +81,29 @@ function save(db) {
   // Refresh the load() cache to exactly what we just wrote → the next load() skips a re-read + scryptSync-decrypt (F1). On a
   // stat failure INVALIDATE (never keep a stale cache) so the next load() re-reads from disk.
   try { const _st = fs.statSync(file); _cache = db; _cacheMtime = _st.mtimeMs; _cacheFile = file; _cacheSize = _st.size; _cacheIno = _st.ino; } catch { _invalidate(); }
+}
+
+// ★#8: cross-process-safe read-modify-write for ADMIN scripts (revoke/gen-key/reset-hwid/suspend/extend/reset-keys/
+// rotate-keys). load → mutateFn(db) → save({cas:true}); on a KEYSTORE_CONFLICT (the live server persisted a lastSeen/
+// flag/bind since our load) RE-LOAD fresh and re-apply, bounded. Returns mutateFn's return value; THROWS if retries are
+// exhausted (callers must keep their non-zero exit so a not-actually-revoked key never reads as success). CONTRACT:
+// mutateFn MUST be idempotent under re-apply and MUST NOT mint per-run randomness inside it — generate any new key with
+// crypto.randomBytes OUTSIDE mutate(), then only ASSIGN it inside (else each retry mints a different key). Admin-only:
+// it _invalidate()s to force a fresh read per attempt, which is irrelevant to the short-lived admin process but must not
+// be called from the long-lived server (which relies on the F1 anti-DoS load cache).
+function mutate(mutateFn, opts) {
+  opts = opts || {};
+  const retries = Number.isFinite(opts.retries) ? opts.retries : 5;
+  for (let attempt = 0; ; attempt++) {
+    _invalidate();            // force a fresh disk read each attempt — re-apply onto the OTHER writer's committed state
+    const db = load();
+    const ret = mutateFn(db);
+    try { save(db, { cas: true }); return ret; }
+    catch (e) {
+      if (e && e.code === 'KEYSTORE_CONFLICT' && attempt < retries) continue;
+      throw e;
+    }
+  }
 }
 
 function auditPath() { return path.join(path.dirname(keysPath()), 'key-audit.log'); }
@@ -114,6 +158,12 @@ function recordDeviceConcurrency(rec, hwid, now, opts) {
 // ★VERSION GATE (2026-08-15): compare two dotted numeric versions. Returns true iff a < b. Tolerant of missing parts +
 // non-numeric segments (treated as 0) and never throws — a garbled version string must never gate a legit client (the
 // caller only gates when BOTH the client version AND the required minimum are present + parse to real numbers).
+// ★LEAK-TRACE (2026-08-17): the CUSTOMER part of a per-build seat watermark. A customer's four brand builds are watermarked
+// client-one / client-one-app1 / -app2 / -app3 (one key covers all four on one machine), so strip a trailing -app<n> brand
+// suffix → they all map to the SAME customer. Lets the server flag a LEAKED build (a key checking in from a build watermarked
+// for a DIFFERENT customer) without ever false-flagging a legit multi-brand seat. PURE → unit-tested.
+function seatClient(seat) { return String(seat == null ? '' : seat).replace(/-app\d+$/i, ''); }
+
 function semverLt(a, b) {
   const pa = String(a == null ? '' : a).split('.').map((x) => parseInt(x, 10) || 0);
   const pb = String(b == null ? '' : b).split('.').map((x) => parseInt(x, 10) || 0);
@@ -158,4 +208,4 @@ function sumAppTelemetry(rec) {
   return { acc: Number(rec.lastAccounts) || 0, grp: Number(rec.lastGroups) || 0, apps: 0 };
 }
 
-module.exports = { load, save, audit, keysPath, isEncryptedAtRest, recordValidationIp, recordDeviceConcurrency, semverLt, recordAppTelemetry, sumAppTelemetry };
+module.exports = { load, save, mutate, audit, keysPath, isEncryptedAtRest, recordValidationIp, recordDeviceConcurrency, semverLt, seatClient, recordAppTelemetry, sumAppTelemetry };

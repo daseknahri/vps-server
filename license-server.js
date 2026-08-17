@@ -358,6 +358,11 @@ const FLAG_HWIDS = 2;                                              // bound mach
 const RATE_HITS = Number(process.env.CLONE_RATE_HITS) || 40;       // same-hwid validate count in the window that implies multiple concurrent instances (tunable; keep >> a 4-brand seat)
 const SUSPEND_HWIDS = Number(process.env.CLONE_SUSPEND_HWIDS) || 3; // auto-suspend bar (only when CLONE_AUTOSUSPEND=1)
 const CLONE_AUTOSUSPEND = String(process.env.CLONE_AUTOSUSPEND || '').trim() === '1';
+// ★LEAK-TRACE (2026-08-17): auto-suspend a key whose build watermark (seat) belongs to a DIFFERENT customer than it first
+// activated with — a leaked build in the wild. OFF by default (flag-only, operator reviews); set LEAK_AUTOSUSPEND=1 to auto-act.
+const LEAK_AUTOSUSPEND = String(process.env.LEAK_AUTOSUSPEND || '').trim() === '1';
+// seatClient (the CUSTOMER part of a build seat — strips the -app<n> brand suffix so a legit 4-brand seat never mismatches)
+// lives in keystore.js (ks.seatClient), unit-tested alongside the other pure helpers.
 // Validate + bind a license to one machine (HWID). First activation binds; later launches must come
 // from the same machine. Revoked/expired keys are rejected. Returns the tier + limits the client
 // enforces (per-seat model).
@@ -368,6 +373,7 @@ app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validat
   const acc = Math.max(0, Math.min(99999, Number((req.body && req.body.acc)) || 0)); // reported account count — telemetry only
   const grp = Math.max(0, Math.min(99999, Number((req.body && req.body.grp)) || 0)); // reported group count — telemetry only
   const brand = String((req.body && req.body.brand) || ''); // reported brand-app name — telemetry only; recordAppTelemetry sanitizes it HARD (strips to [a-z0-9-], caps length, rejects proto names). ★2026-08-16: this was UNDECLARED at line ~348 → ReferenceError on every re-validation → 500 → offline-grace lockout. Declared here + the tail is now try-wrapped so telemetry can never break the grant.
+  const seat = String((req.body && req.body.seat) || '').replace(/[^A-Za-z0-9._-]/g, '').slice(0, 64); // ★LEAK-TRACE: per-build customer watermark — telemetry + leak detection. STRIP to safe chars (renders RAW in list-keys.js, same ANSI-hiding concern as ver/hwid). '' from an older/cracked client → grandfathered (never a denial).
   // round-4: reject an empty/short hwid up front. An empty hwid binds FALSY (rec.hwid='' → never actually locks, so any
   // machine re-binds it) AND skips the "already active on another device" check below → a known key can be squatted/pre-bound
   // by anyone who learns the string, locking out the real buyer. The legit client never POSTs a null/short id (a real
@@ -394,12 +400,15 @@ app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validat
   // install. Capped — it is opaque to us and only ever compared for equality.
   const nonce = String((req.body && req.body.nonce) || '').trim().slice(0, 64);
   const grant = () => ({
-    valid: true, message: 'OK', tier: rec.tier || 'standard', maxAccounts: rec.maxAccounts, maxGroups: rec.maxGroups, expires: rec.expires || 0,
+    // ★NOTICE CHANNEL (2026-08-17): rec.message (operator-set per key) rides the grant → the client surfaces it in its
+    // license status. A soft, non-blocking way to reach one client ("your trial ends in 3 days", "payment overdue") without
+    // suspending — for a hard stop use suspend.js/revoke.js. Defaults to 'OK' so behaviour is unchanged unless a message is set.
+    valid: true, message: rec.message || 'OK', tier: rec.tier || 'standard', maxAccounts: rec.maxAccounts, maxGroups: rec.maxGroups, expires: rec.expires || 0,
     // Sign against the BOUND machine, not merely the requesting one, so the token can never attest to a device the
     // key store did not actually bind.
     ...signGrant({ license, hwid: rec.hwid || hwid, tier: rec.tier, expires: rec.expires, nonce }),
   });
-  if (rec.hwid == null) { rec.hwid = hwid; rec.activatedAt = Date.now(); rec.hwidLog = [{ hwid, ts: Date.now(), n: 1 }]; /* ★RANK-2b: seed the concurrency log on a fresh bind / reset-hwid rebind so a stale pre-reset hwid can't instantly read as a second machine */ try { if (ver) rec.lastVersion = ver; if (!ks.recordAppTelemetry(rec, brand, { ver, acc, grp }, Date.now())) { if (acc) rec.lastAccounts = acc; if (grp) rec.lastGroups = grp; } } catch {} /* ★2026-08-16 F2: record telemetry on FIRST activation too, else a fresh key shows no ver/acc/grp until its first hourly re-validation */ ks.save(db); ks.audit('bind', license, 'hwid=' + hwid.slice(0, 8)); return res.json({ ...grant(), message: 'Activated' }); } // == null (not !rec.hwid): a genuinely UNBOUND record is null (gen-key / reset-hwid); a hand-edited/legacy '' hwid must NOT be treated as bindable-by-anyone — it falls to the strict compare below and is rejected as "already active on another device" (fail closed). New binds always write a ≥8-char id (front-door gate), so real records are never '' → no legit impact.
+  if (rec.hwid == null) { rec.hwid = hwid; rec.activatedAt = Date.now(); rec.hwidLog = [{ hwid, ts: Date.now(), n: 1 }]; /* ★RANK-2b: seed the concurrency log on a fresh bind / reset-hwid rebind so a stale pre-reset hwid can't instantly read as a second machine */ try { if (ver) rec.lastVersion = ver; if (!ks.recordAppTelemetry(rec, brand, { ver, acc, grp }, Date.now())) { if (acc) rec.lastAccounts = acc; if (grp) rec.lastGroups = grp; } if (seat) { rec.lastSeat = seat; const _sc = ks.seatClient(seat); if (_sc) rec.seatClient = _sc; } } catch {} /* ★2026-08-16 F2: record telemetry on FIRST activation too, else a fresh key shows no ver/acc/grp until its first hourly re-validation. ★LEAK-TRACE: seed the seat baseline here so a leaked build is caught on its FIRST re-check, not one cycle late */ ks.save(db); ks.audit('bind', license, 'hwid=' + hwid.slice(0, 8)); return res.json({ ...grant(), message: 'Activated' }); } // == null (not !rec.hwid): a genuinely UNBOUND record is null (gen-key / reset-hwid); a hand-edited/legacy '' hwid must NOT be treated as bindable-by-anyone — it falls to the strict compare below and is rejected as "already active on another device" (fail closed). New binds always write a ≥8-char id (front-door gate), so real records are never '' → no legit impact.
   if (hwid && rec.hwid !== hwid) {
     // ★RANK-2b (2026-08-16): a DIFFERENT hwid on a BOUND key is either the honest owner on a new PC (rare; handled by reset-hwid)
     // or the key being run on a SECOND MACHINE. We STILL DENY (the bind-lock holds) but RECORD the attempt so a real second box —
@@ -464,6 +473,30 @@ app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validat
       if (!_wasFlagged) { try { ks.audit('flag', license, 'multi-instance rate=' + hits + ' in ' + (CONC_WINDOW_MS / 3600000) + 'h (same-hwid clones behind one NAT? — review)'); } catch {} _lastSeenSaved.set(license, rec.lastSeen); ks.save(db); }
     }
   } catch (e) { try { console.error('hwid-rate:', e.message); } catch {} }
+  // ★LEAK-TRACE (2026-08-17): bind key→customer (from the per-build seat watermark) and FLAG a leaked build — a key checking
+  // in from a build watermarked for a DIFFERENT customer than it first activated with = the build or the key crossed hands.
+  // A customer's 4 brand builds share the same customer part (seatClient strips -app<n>), so a legit multi-brand seat never
+  // trips. FLAG-only by default (a re-issued/renamed seat is benign — operator reviews via list-keys + key-audit.log);
+  // LEAK_AUTOSUSPEND=1 opts into auto-suspend. Save is flag-once/debounced like the other flags → no scryptSync per request.
+  try {
+    if (seat) {
+      rec.lastSeat = seat;
+      const sc = ks.seatClient(seat);
+      if (sc && !rec.seatClient) { rec.seatClient = sc; } // bind the customer baseline on first sighting
+      else if (sc && rec.seatClient !== sc) {
+        const _wasFlagged = rec.flagged && rec.flagged.reason === 'seat-mismatch';
+        rec.flagged = { reason: 'seat-mismatch', expected: rec.seatClient, got: sc, seat, at: rec.lastSeen };
+        if (LEAK_AUTOSUSPEND && !rec.suspended) {
+          rec.suspended = true; rec.suspendMessage = 'License suspended — this build was issued to a different customer (auto). Contact support.';
+          try { ks.audit('suspend', license, 'AUTO seat-mismatch expected=' + rec.seatClient + ' got=' + sc + ' (LEAK_AUTOSUSPEND) — REVERSIBLE: suspend.js --lift'); } catch {}
+          _lastSeenSaved.set(license, rec.lastSeen); ks.save(db);
+        } else if (!_wasFlagged) {
+          try { ks.audit('flag', license, 'SEAT MISMATCH expected=' + rec.seatClient + ' got=' + sc + ' seat=' + seat + ' (leaked build / shared key — review + revoke/suspend)'); } catch {}
+          _lastSeenSaved.set(license, rec.lastSeen); ks.save(db);
+        }
+      }
+    }
+  } catch (e) { try { console.error('seat-track:', e.message); } catch {} }
   } catch (e) { try { console.error('validate telemetry (non-fatal):', e && e.message); } catch {} } // ★2026-08-16 OUTER guard close: telemetry/persist/clone-flag can never break the grant
   return res.json(grant());
 });
