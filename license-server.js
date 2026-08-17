@@ -367,6 +367,9 @@ const LEAK_AUTOSUSPEND = String(process.env.LEAK_AUTOSUSPEND || '').trim() === '
 // from the same machine. Revoked/expired keys are rejected. Returns the tier + limits the client
 // enforces (per-seat model).
 app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validate' }), (req, res) => {
+  // ★#8 CAS INVARIANT (2026-08-17): the ks.save(db, { cas: true }) calls below rely on load→save staying SYNCHRONOUS — do
+  // NOT introduce an `await` between ks.load() and any ks.save() in this handler. An await would let another request
+  // interleave and break the "module-cached identity == the db this save is derived from" invariant the CAS depends on.
   const license = String((req.body && req.body.license) || '').trim().toUpperCase();
   const hwid = String((req.body && req.body.hwid) || '').replace(/[^\x20-\x7E]/g, '').trim().slice(0, 128); // ★2026-08-16: strip non-printable/ANSI + cap length — mirror the `ver` sanitize below (rec.hwid renders RAW in list-keys.js, so a control/ESC-injected hwid could CONCEAL a ⚠️ clone flag in the operator's terminal). node-machine-id's real id is sha256-hex/GUID/hostname — all printable ASCII — so a legit seat is untouched (no device-lock regression); an all-ANSI hwid strips to '' and is rejected by the length gate below.
   const ver = String((req.body && req.body.ver) || '').replace(/[^0-9.a-z-]/gi, '').slice(0, 24); // client app version — telemetry + the version gate. STRIP to version chars (adversary #2): ver is rendered RAW in list-keys.js, so control/ANSI chars could hide a CLONE flag in the operator's terminal. ('' from an older client → grandfathered)
@@ -408,7 +411,7 @@ app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validat
     // key store did not actually bind.
     ...signGrant({ license, hwid: rec.hwid || hwid, tier: rec.tier, expires: rec.expires, nonce }),
   });
-  if (rec.hwid == null) { rec.hwid = hwid; rec.activatedAt = Date.now(); rec.hwidLog = [{ hwid, ts: Date.now(), n: 1 }]; /* ★RANK-2b: seed the concurrency log on a fresh bind / reset-hwid rebind so a stale pre-reset hwid can't instantly read as a second machine */ try { if (ver) rec.lastVersion = ver; if (!ks.recordAppTelemetry(rec, brand, { ver, acc, grp }, Date.now())) { if (acc) rec.lastAccounts = acc; if (grp) rec.lastGroups = grp; } if (seat) { rec.lastSeat = seat; const _sc = ks.seatClient(seat); if (_sc) rec.seatClient = _sc; } } catch {} /* ★2026-08-16 F2: record telemetry on FIRST activation too, else a fresh key shows no ver/acc/grp until its first hourly re-validation. ★LEAK-TRACE: seed the seat baseline here so a leaked build is caught on its FIRST re-check, not one cycle late */ ks.save(db); ks.audit('bind', license, 'hwid=' + hwid.slice(0, 8)); return res.json({ ...grant(), message: 'Activated' }); } // == null (not !rec.hwid): a genuinely UNBOUND record is null (gen-key / reset-hwid); a hand-edited/legacy '' hwid must NOT be treated as bindable-by-anyone — it falls to the strict compare below and is rejected as "already active on another device" (fail closed). New binds always write a ≥8-char id (front-door gate), so real records are never '' → no legit impact.
+  if (rec.hwid == null) { rec.hwid = hwid; rec.activatedAt = Date.now(); rec.hwidLog = [{ hwid, ts: Date.now(), n: 1 }]; /* ★RANK-2b: seed the concurrency log on a fresh bind / reset-hwid rebind so a stale pre-reset hwid can't instantly read as a second machine */ try { if (ver) rec.lastVersion = ver; if (!ks.recordAppTelemetry(rec, brand, { ver, acc, grp }, Date.now())) { if (acc) rec.lastAccounts = acc; if (grp) rec.lastGroups = grp; } if (seat) { rec.lastSeat = seat; const _sc = ks.seatClient(seat); if (_sc) rec.seatClient = _sc; } } catch {} /* ★2026-08-16 F2: record telemetry on FIRST activation too, else a fresh key shows no ver/acc/grp until its first hourly re-validation. ★LEAK-TRACE: seed the seat baseline here so a leaked build is caught on its FIRST re-check, not one cycle late */ try { ks.save(db, { cas: true }); } catch (e) { if (!(e && e.code === 'KEYSTORE_CONFLICT')) throw e; } /* ★#8 CAS: an admin write (revoke/reset) won the race — skip the bind; it self-heals on the next launch after load() re-reads disk */ ks.audit('bind', license, 'hwid=' + hwid.slice(0, 8)); return res.json({ ...grant(), message: 'Activated' }); } // == null (not !rec.hwid): a genuinely UNBOUND record is null (gen-key / reset-hwid); a hand-edited/legacy '' hwid must NOT be treated as bindable-by-anyone — it falls to the strict compare below and is rejected as "already active on another device" (fail closed). New binds always write a ≥8-char id (front-door gate), so real records are never '' → no legit impact.
   if (hwid && rec.hwid !== hwid) {
     // ★RANK-2b (2026-08-16): a DIFFERENT hwid on a BOUND key is either the honest owner on a new PC (rare; handled by reset-hwid)
     // or the key being run on a SECOND MACHINE. We STILL DENY (the bind-lock holds) but RECORD the attempt so a real second box —
@@ -422,10 +425,10 @@ app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validat
         if (CLONE_AUTOSUSPEND && distinctHwids >= SUSPEND_HWIDS && !rec.suspended) {
           rec.suspended = true; rec.suspendMessage = 'License suspended — key active on ' + distinctHwids + ' machines (auto). Contact support.';
           try { ks.audit('suspend', license, 'AUTO multi-hwid=' + distinctHwids + ' (CLONE_AUTOSUSPEND) — REVERSIBLE with suspend.js --lift'); } catch {}
-          _lastSeenSaved.set(license, Date.now()); ks.save(db);
+          _lastSeenSaved.set(license, Date.now()); ks.save(db, { cas: true });
         } else if (!_wasFlagged) { // persist + audit ONCE on the FIRST raise (mirror the multi-ip flag — never a scryptSync save per request)
           try { ks.audit('flag', license, 'multi-hwid=' + distinctHwids + ' in ' + (CONC_WINDOW_MS / 3600000) + 'h (second machine — review + suspend/revoke if shared)'); } catch {}
-          _lastSeenSaved.set(license, Date.now()); ks.save(db);
+          _lastSeenSaved.set(license, Date.now()); ks.save(db, { cas: true });
         }
       }
     } catch (e) { try { console.error('hwid-concurrency:', e.message); } catch {} }
@@ -442,7 +445,7 @@ app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validat
   const _sb = ks.recordAppTelemetry(rec, brand, { ver, acc, grp }, rec.lastSeen); // per-brand aggregate → combined per-client total (list-keys.js sums rec.apps)
   if (!_sb) { if (acc) rec.lastAccounts = acc; if (grp) rec.lastGroups = grp; } // no brand (older client) → flat single-app telemetry
   const _lsPrev = _lastSeenSaved.get(license) || 0;
-  if (rec.lastSeen - _lsPrev > 3600000) { _lastSeenSaved.set(license, rec.lastSeen); ks.save(db); } // persist at most hourly per license (mtime-cached load + this debounce = a re-validation flood costs ~0 scrypt/disk)
+  if (rec.lastSeen - _lsPrev > 3600000) { _lastSeenSaved.set(license, rec.lastSeen); ks.save(db, { cas: true }); } // persist at most hourly per license (mtime-cached load + this debounce = a re-validation flood costs ~0 scrypt/disk)
   // ★RANK-2 (2026-08-15): flag a probable MachineGuid CLONE by IP fan-out — the one clone vector the client hwid lock can't
   // catch (every clone presents the same bound hwid, so the `rec.hwid !== hwid` check above passes for all copies). FLAG
   // ONLY, never deny: a legit roaming/mobile/VPN seat also spans IPs, so the operator reviews flagged keys (visible in
@@ -457,7 +460,7 @@ app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validat
       // ★2026-08-15 DoS fix (adversary #1): persist + audit ONCE, only on the FIRST raise — NEVER per new IP. Every encrypted
       // ks.save() runs scryptSync (CPU-hard, blocks the event loop), so saving per-IP let a bound key POSTing from >50
       // rotating IPs pin the server. The flag count still refreshes in-memory each request; the hourly debounce flushes it.
-      if (!_wasFlagged) { try { ks.audit('flag', license, 'multi-ip fan-out=' + distinct + ' in 24h (possible MachineGuid clone) — review + suspend/revoke if shared'); } catch {} _lastSeenSaved.set(license, rec.lastSeen); ks.save(db); }
+      if (!_wasFlagged) { try { ks.audit('flag', license, 'multi-ip fan-out=' + distinct + ' in 24h (possible MachineGuid clone) — review + suspend/revoke if shared'); } catch {} _lastSeenSaved.set(license, rec.lastSeen); ks.save(db, { cas: true }); }
     }
   } catch (e) { try { console.error('ip-track:', e.message); } catch {} }
   // ★RANK-2b (2026-08-16): same-hwid CONCURRENCY by validate RATE — the blind spot IP fan-out AND the bind-lock both miss: clones
@@ -470,7 +473,7 @@ app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validat
     if (hits >= RATE_HITS && distinctHwids <= 1) { // distinctHwids>1 is already covered by the stronger multi-hwid flag on the deny path
       const _wasFlagged = rec.flagged && rec.flagged.reason === 'multi-instance-rate';
       rec.flagged = { reason: 'multi-instance-rate', hits, at: rec.lastSeen };
-      if (!_wasFlagged) { try { ks.audit('flag', license, 'multi-instance rate=' + hits + ' in ' + (CONC_WINDOW_MS / 3600000) + 'h (same-hwid clones behind one NAT? — review)'); } catch {} _lastSeenSaved.set(license, rec.lastSeen); ks.save(db); }
+      if (!_wasFlagged) { try { ks.audit('flag', license, 'multi-instance rate=' + hits + ' in ' + (CONC_WINDOW_MS / 3600000) + 'h (same-hwid clones behind one NAT? — review)'); } catch {} _lastSeenSaved.set(license, rec.lastSeen); ks.save(db, { cas: true }); }
     }
   } catch (e) { try { console.error('hwid-rate:', e.message); } catch {} }
   // ★LEAK-TRACE (2026-08-17): bind key→customer (from the per-build seat watermark) and FLAG a leaked build — a key checking
@@ -489,10 +492,10 @@ app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validat
         if (LEAK_AUTOSUSPEND && !rec.suspended) {
           rec.suspended = true; rec.suspendMessage = 'License suspended — this build was issued to a different customer (auto). Contact support.';
           try { ks.audit('suspend', license, 'AUTO seat-mismatch expected=' + rec.seatClient + ' got=' + sc + ' (LEAK_AUTOSUSPEND) — REVERSIBLE: suspend.js --lift'); } catch {}
-          _lastSeenSaved.set(license, rec.lastSeen); ks.save(db);
+          _lastSeenSaved.set(license, rec.lastSeen); ks.save(db, { cas: true });
         } else if (!_wasFlagged) {
           try { ks.audit('flag', license, 'SEAT MISMATCH expected=' + rec.seatClient + ' got=' + sc + ' seat=' + seat + ' (leaked build / shared key — review + revoke/suspend)'); } catch {}
-          _lastSeenSaved.set(license, rec.lastSeen); ks.save(db);
+          _lastSeenSaved.set(license, rec.lastSeen); ks.save(db, { cas: true });
         }
       }
     }
