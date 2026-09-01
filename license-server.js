@@ -509,6 +509,65 @@ app.get('/api/keys', rateLimiter({ windowMs: 60000, max: 20, name: 'keys' }), ad
   try { res.json(ks.load()); } catch (e) { res.status(503).json({ error: 'key store unavailable: ' + e.message }); }
 });
 
+// ★2026-09-01 (anti-theft hunt — operator CONTROL PANEL): a browser-friendly, live, read-only admin dashboard at GET /admin.
+// Guarded by the SAME ADMIN_TOKEN as /api/keys but via HTTP BASIC auth (a browser can't send a Bearer header on a plain page
+// navigation) — any username, the ADMIN_TOKEN as the password, constant-time compared (safeEq). Server-RENDERED (no client JS,
+// no token in any URL/log), rate-limited, meta-refreshed. License keys are MASKED (first4…last4) so a screenshot/shoulder-surf
+// can't leak a full key — the full store stays behind /api/keys / list-keys.js. Read-only: it never mutates the store.
+function adminBasic(req, res, next) {
+  const token = process.env.ADMIN_TOKEN;
+  if (!token) return res.status(403).type('text/plain').send('admin disabled — set ADMIN_TOKEN on the server');
+  const m = /^Basic\s+([A-Za-z0-9+/=]+)$/.exec(String(req.get('authorization') || ''));
+  let pass = '';
+  if (m) { try { const dec = Buffer.from(m[1], 'base64').toString('utf8'); const i = dec.indexOf(':'); pass = i >= 0 ? dec.slice(i + 1) : dec; } catch {} } // Basic base64(user:PASS) → the ADMIN_TOKEN is PASS (may contain colons)
+  if (!pass || !safeEq(pass, token)) { res.set('WWW-Authenticate', 'Basic realm="za-admin", charset="UTF-8"'); return res.status(401).type('text/plain').send('Authentication required'); }
+  next();
+}
+function _escH(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+function _ago(ms) { if (!ms) return '—'; const s = Math.max(0, Math.floor((Date.now() - Number(ms)) / 1000)); if (s < 60) return s + 's'; if (s < 3600) return Math.floor(s / 60) + 'm'; if (s < 86400) return Math.floor(s / 3600) + 'h'; return Math.floor(s / 86400) + 'd'; }
+function renderAdminHtml(db) {
+  const now = Date.now();
+  const keys = Object.keys(db || {}).sort((a, b) => String((db[a] && db[a].note) || '').localeCompare(String((db[b] && db[b].note) || '')));
+  let active = 0, flagged = 0, suspended = 0, revoked = 0, totAcc = 0, totGrp = 0;
+  const rows = keys.map((k) => {
+    const r = db[k] || {};
+    const isExp = r.expires && r.expires < now;
+    const status = r.revoked ? 'revoked' : r.suspended ? 'suspended' : isExp ? 'expired' : 'active';
+    if (status === 'active') active++;
+    if (r.revoked) revoked++; if (r.suspended) suspended++;
+    const fl = r.flagged && r.flagged.reason; if (fl) flagged++;
+    const t = ks.sumAppTelemetry ? ks.sumAppTelemetry(r) : { acc: r.lastAccounts || 0, grp: r.lastGroups || 0, apps: 0 };
+    totAcc += Number(t.acc) || 0; totGrp += Number(t.grp) || 0;
+    const mask = k.length > 9 ? (k.slice(0, 4) + '…' + k.slice(-4)) : k;
+    const flTxt = fl ? (r.flagged.reason === 'seat-mismatch' ? ('seat≠' + _escH(r.flagged.got || '')) : (r.flagged.reason + (r.flagged.ips ? ' ' + r.flagged.ips + 'ip' : r.flagged.hwids ? ' ' + r.flagged.hwids + 'hw' : ''))) : '';
+    const ip24 = Array.isArray(r.ipLog) ? r.ipLog.filter((e) => e && now - Number(e.ts) <= 86400000).length : 0;
+    return '<tr class="s-' + status + (fl ? ' fl' : '') + '">'
+      + '<td>' + _escH(r.note || '—') + '</td><td class="dim">' + _escH(r.seatClient || '—') + '</td>'
+      + '<td><code>' + _escH(mask) + '</code></td><td>' + _escH(r.tier || 'std') + '</td>'
+      + '<td class="st">' + status + '</td><td>' + (r.hwid ? '<code>' + _escH(String(r.hwid).slice(0, 8)) + '…</code>' : '<span class="dim">unbound</span>') + '</td>'
+      + '<td>' + _ago(r.lastSeen) + '</td><td>' + _escH(r.lastVersion || '?') + '</td>'
+      + '<td class="num">' + (Number(t.acc) || 0) + '</td><td class="num">' + (Number(t.grp) || 0) + '</td>'
+      + '<td class="num">' + (ip24 || '') + '</td><td class="fl">' + flTxt + '</td></tr>';
+  }).join('');
+  return '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+    + '<meta http-equiv="refresh" content="45"><title>za-post · licenses</title><style>'
+    + ':root{color-scheme:dark}body{background:#0e1116;color:#d7dde3;font:13px/1.5 -apple-system,Segoe UI,system-ui,sans-serif;margin:0;padding:20px}'
+    + 'h1{font-size:15px;margin:0 0 4px}.sub{color:#8b95a1;font-size:12px;margin-bottom:14px}'
+    + 'table{border-collapse:collapse;width:100%;font-size:12.5px}th,td{text-align:left;padding:6px 9px;border-bottom:1px solid #1c2230;white-space:nowrap}'
+    + 'th{color:#8b95a1;font-weight:600;position:sticky;top:0;background:#0e1116}tr.fl{background:#2a1d0e}'
+    + 'td.st{text-transform:uppercase;font-size:11px}tr.s-active td.st{color:#4ade80}tr.s-revoked td.st{color:#f87171}tr.s-suspended td.st{color:#fbbf24}tr.s-expired td.st{color:#8b95a1}'
+    + 'td.fl{color:#fbbf24}.num{text-align:right;font-variant-numeric:tabular-nums}.dim{color:#8b95a1}code{color:#93c5fd;font:12px ui-monospace,Consolas,monospace}'
+    + '</style></head><body><h1>za-post · license control panel</h1><div class="sub">'
+    + keys.length + ' keys · ' + active + ' active · ' + suspended + ' suspended · ' + revoked + ' revoked · ' + flagged + ' ⚠ flagged · Σ ' + totAcc + ' accounts / ' + totGrp + ' groups · '
+    + _escH(new Date(now).toISOString().replace('T', ' ').slice(0, 19)) + ' UTC · auto-refresh 45s</div>'
+    + '<table><thead><tr><th>Customer</th><th>Seat</th><th>Key</th><th>Tier</th><th>Status</th><th>Machine</th><th>Seen</th><th>Ver</th><th>Acc</th><th>Grp</th><th>IP/24h</th><th>Flag</th></tr></thead><tbody>'
+    + (rows || '<tr><td colspan="12" class="dim">no keys</td></tr>') + '</tbody></table></body></html>';
+}
+app.get('/admin', rateLimiter({ windowMs: 60000, max: 60, name: 'admin' }), adminBasic, (_req, res) => {
+  let db; try { db = ks.load(); } catch (e) { return res.status(503).type('text/plain').send('key store unavailable: ' + ((e && e.message) || e)); }
+  res.set('Cache-Control', 'no-store').type('text/html').send(renderAdminHtml(db));
+});
+
 const PORT = process.env.PORT || 3509;
 if (!ks.isEncryptedAtRest()) console.warn('⚠️  KEYS_ENCRYPTION_KEY is not set — the key store is stored in PLAINTEXT. Set it to encrypt keys.json at rest (see DEPLOY-COOLIFY.md).');
 if (process.env.MIN_CLIENT_VERSION) console.warn('⚠️  VERSION GATE ACTIVE: MIN_CLIENT_VERSION=' + process.env.MIN_CLIENT_VERSION + ' — EVERY client reporting a lower version is denied at its next check (no offline grace). Ensure this is ≤ the version you have actually shipped, or the whole fleet locks out.');
