@@ -547,6 +547,7 @@ function renderAdminHtml(db, token) {
     const af = (act, label, cls) => '<form method="post" action="/admin/act" class="af"><input type="hidden" name="token" value="' + _escH(token) + '"><input type="hidden" name="key" value="' + _escH(k) + '"><input type="hidden" name="action" value="' + act + '"><button class="' + cls + '">' + label + '</button></form>';
     let acts = r.revoked ? af('unrevoke', 'un-revoke', 'b-ok')
       : (af('revoke', 'revoke', 'b-danger') + (r.suspended ? af('unsuspend', 'lift', 'b-ok') : af('suspend', 'suspend', 'b-warn')));
+    if (r.hwid) acts += af('unbind', 'unbind', 'b-warn');
     if (fl) acts += (r.flagged.reason === 'seat-mismatch') ? af('resetseat', 'reset seat', 'b-flat') : af('clearflag', 'clear flag', 'b-flat');
     return '<tr class="s-' + status + (fl ? ' fl' : '') + '">'
       + '<td>' + _escH(r.note || '—') + '</td><td class="dim">' + _escH(r.seatClient || '—') + '</td>'
@@ -588,6 +589,7 @@ function _adminAct(db, key, action) {
   else if (action === 'unsuspend') { r.suspended = false; r.suspendMessage = ''; }
   else if (action === 'clearflag') delete r.flagged;
   else if (action === 'resetseat') { delete r.flagged; delete r.seatClient; delete r.lastSeat; }
+  else if (action === 'unbind') r.hwid = null; // clear the machine binding → the key re-activates on the NEXT machine (fixes a mis-bound key without the reset-hwid CLI)
   else return false;
   return true;
 }
@@ -596,7 +598,7 @@ app.post('/admin/act', rateLimiter({ windowMs: 60000, max: 60, name: 'admin-act'
   if (!process.env.ADMIN_TOKEN || !safeEq(String(b.token || ''), process.env.ADMIN_TOKEN)) return res.status(403).type('text/plain').send('forbidden (missing/invalid form token)');
   const key = String(b.key || '').trim().toUpperCase();
   const action = String(b.action || '').trim();
-  if (!/^(revoke|unrevoke|suspend|unsuspend|clearflag|resetseat)$/.test(action)) return res.status(400).type('text/plain').send('bad action');
+  if (!/^(revoke|unrevoke|suspend|unsuspend|clearflag|resetseat|unbind)$/.test(action)) return res.status(400).type('text/plain').send('bad action');
   let ok = false;
   try { ks.mutate((db) => { ok = _adminAct(db, key, action); }); } catch (e) { return res.status(503).type('text/plain').send('store write failed: ' + ((e && e.message) || e)); }
   try { if (ok) ks.audit('admin-panel', key, action); } catch {}
