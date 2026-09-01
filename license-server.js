@@ -134,6 +134,7 @@ function signGrant({ license, hwid, tier, expires, nonce }) {
 
 const app = express();
 app.use(express.json({ limit: '64kb' }));
+app.use(express.urlencoded({ extended: false, limit: '16kb' })); // ★2026-09-01: parse the /admin control-panel action FORMS (POST /admin/act)
 app.set('trust proxy', 1); // we sit behind an HTTPS reverse proxy; trust X-Forwarded-* for req.ip
 
 // Dependency-free fixed-window rate limiter (M3-04). Per-IP; throttles brute-force key guessing and
@@ -525,7 +526,7 @@ function adminBasic(req, res, next) {
 }
 function _escH(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 function _ago(ms) { if (!ms) return '—'; const s = Math.max(0, Math.floor((Date.now() - Number(ms)) / 1000)); if (s < 60) return s + 's'; if (s < 3600) return Math.floor(s / 60) + 'm'; if (s < 86400) return Math.floor(s / 3600) + 'h'; return Math.floor(s / 86400) + 'd'; }
-function renderAdminHtml(db) {
+function renderAdminHtml(db, token) {
   const now = Date.now();
   const keys = Object.keys(db || {}).sort((a, b) => String((db[a] && db[a].note) || '').localeCompare(String((db[b] && db[b].note) || '')));
   let active = 0, flagged = 0, suspended = 0, revoked = 0, totAcc = 0, totGrp = 0;
@@ -541,13 +542,20 @@ function renderAdminHtml(db) {
     const mask = k.length > 9 ? (k.slice(0, 4) + '…' + k.slice(-4)) : k;
     const flTxt = fl ? (r.flagged.reason === 'seat-mismatch' ? ('seat≠' + _escH(r.flagged.got || '')) : (r.flagged.reason + (r.flagged.ips ? ' ' + r.flagged.ips + 'ip' : r.flagged.hwids ? ' ' + r.flagged.hwids + 'hw' : ''))) : '';
     const ip24 = Array.isArray(r.ipLog) ? r.ipLog.filter((e) => e && now - Number(e.ts) <= 86400000).length : 0;
+    // Per-row action FORMS (POST /admin/act). Each carries the ADMIN_TOKEN in a hidden field — the CSRF defense: a cross-origin
+    // attacker can't read this authed page, so it can't forge the token even if the browser auto-sends the Basic creds.
+    const af = (act, label, cls) => '<form method="post" action="/admin/act" class="af"><input type="hidden" name="token" value="' + _escH(token) + '"><input type="hidden" name="key" value="' + _escH(k) + '"><input type="hidden" name="action" value="' + act + '"><button class="' + cls + '">' + label + '</button></form>';
+    let acts = r.revoked ? af('unrevoke', 'un-revoke', 'b-ok')
+      : (af('revoke', 'revoke', 'b-danger') + (r.suspended ? af('unsuspend', 'lift', 'b-ok') : af('suspend', 'suspend', 'b-warn')));
+    if (fl) acts += (r.flagged.reason === 'seat-mismatch') ? af('resetseat', 'reset seat', 'b-flat') : af('clearflag', 'clear flag', 'b-flat');
     return '<tr class="s-' + status + (fl ? ' fl' : '') + '">'
       + '<td>' + _escH(r.note || '—') + '</td><td class="dim">' + _escH(r.seatClient || '—') + '</td>'
       + '<td><code>' + _escH(mask) + '</code></td><td>' + _escH(r.tier || 'std') + '</td>'
       + '<td class="st">' + status + '</td><td>' + (r.hwid ? '<code>' + _escH(String(r.hwid).slice(0, 8)) + '…</code>' : '<span class="dim">unbound</span>') + '</td>'
       + '<td>' + _ago(r.lastSeen) + '</td><td>' + _escH(r.lastVersion || '?') + '</td>'
       + '<td class="num">' + (Number(t.acc) || 0) + '</td><td class="num">' + (Number(t.grp) || 0) + '</td>'
-      + '<td class="num">' + (ip24 || '') + '</td><td class="fl">' + flTxt + '</td></tr>';
+      + '<td class="num">' + (ip24 || '') + '</td><td class="fl">' + flTxt + '</td>'
+      + '<td class="act">' + acts + '</td></tr>';
   }).join('');
   return '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
     + '<meta http-equiv="refresh" content="45"><title>za-post · licenses</title><style>'
@@ -557,15 +565,42 @@ function renderAdminHtml(db) {
     + 'th{color:#8b95a1;font-weight:600;position:sticky;top:0;background:#0e1116}tr.fl{background:#2a1d0e}'
     + 'td.st{text-transform:uppercase;font-size:11px}tr.s-active td.st{color:#4ade80}tr.s-revoked td.st{color:#f87171}tr.s-suspended td.st{color:#fbbf24}tr.s-expired td.st{color:#8b95a1}'
     + 'td.fl{color:#fbbf24}.num{text-align:right;font-variant-numeric:tabular-nums}.dim{color:#8b95a1}code{color:#93c5fd;font:12px ui-monospace,Consolas,monospace}'
+    + '.af{display:inline;margin:0 3px 0 0}td.act{white-space:nowrap}td.act button{font:11px inherit;padding:2px 7px;border:1px solid #2a3346;border-radius:4px;background:#1a2130;color:#d7dde3;cursor:pointer}td.act button:hover{background:#232c3d}.b-danger{border-color:#5a2020;color:#f87171}.b-warn{border-color:#5a4520;color:#fbbf24}.b-ok{border-color:#20502f;color:#4ade80}.b-flat{color:#93c5fd}'
     + '</style></head><body><h1>za-post · license control panel</h1><div class="sub">'
     + keys.length + ' keys · ' + active + ' active · ' + suspended + ' suspended · ' + revoked + ' revoked · ' + flagged + ' ⚠ flagged · Σ ' + totAcc + ' accounts / ' + totGrp + ' groups · '
     + _escH(new Date(now).toISOString().replace('T', ' ').slice(0, 19)) + ' UTC · auto-refresh 45s</div>'
-    + '<table><thead><tr><th>Customer</th><th>Seat</th><th>Key</th><th>Tier</th><th>Status</th><th>Machine</th><th>Seen</th><th>Ver</th><th>Acc</th><th>Grp</th><th>IP/24h</th><th>Flag</th></tr></thead><tbody>'
-    + (rows || '<tr><td colspan="12" class="dim">no keys</td></tr>') + '</tbody></table></body></html>';
+    + '<table><thead><tr><th>Customer</th><th>Seat</th><th>Key</th><th>Tier</th><th>Status</th><th>Machine</th><th>Seen</th><th>Ver</th><th>Acc</th><th>Grp</th><th>IP/24h</th><th>Flag</th><th>Actions</th></tr></thead><tbody>'
+    + (rows || '<tr><td colspan="13" class="dim">no keys</td></tr>') + '</tbody></table></body></html>';
 }
 app.get('/admin', rateLimiter({ windowMs: 60000, max: 60, name: 'admin' }), adminBasic, (_req, res) => {
   let db; try { db = ks.load(); } catch (e) { return res.status(503).type('text/plain').send('key store unavailable: ' + ((e && e.message) || e)); }
-  res.set('Cache-Control', 'no-store').type('text/html').send(renderAdminHtml(db));
+  res.set('Cache-Control', 'no-store').type('text/html').send(renderAdminHtml(db, process.env.ADMIN_TOKEN || ''));
+});
+// ★2026-09-01: control-panel ACTIONS. POST /admin/act performs one key action (revoke/unrevoke/suspend/unsuspend/clearflag/
+// resetseat). Double-guarded: adminBasic (the same ADMIN_TOKEN via Basic auth) AND a matching ADMIN_TOKEN in the FORM BODY —
+// the CSRF defense, since that body token lives only in the authed page a cross-origin attacker can't read. CAS-safe (ks.mutate),
+// audited, action-whitelisted, then PRG-redirects back to /admin. Owner-tier keys are server-inert (they short-circuit client-side).
+function _adminAct(db, key, action) {
+  const r = db[key]; if (!r) return false;
+  if (action === 'revoke') r.revoked = true;
+  else if (action === 'unrevoke') r.revoked = false;
+  else if (action === 'suspend') r.suspended = true;
+  else if (action === 'unsuspend') { r.suspended = false; r.suspendMessage = ''; }
+  else if (action === 'clearflag') delete r.flagged;
+  else if (action === 'resetseat') { delete r.flagged; delete r.seatClient; delete r.lastSeat; }
+  else return false;
+  return true;
+}
+app.post('/admin/act', rateLimiter({ windowMs: 60000, max: 60, name: 'admin-act' }), adminBasic, (req, res) => {
+  const b = req.body || {};
+  if (!process.env.ADMIN_TOKEN || !safeEq(String(b.token || ''), process.env.ADMIN_TOKEN)) return res.status(403).type('text/plain').send('forbidden (missing/invalid form token)');
+  const key = String(b.key || '').trim().toUpperCase();
+  const action = String(b.action || '').trim();
+  if (!/^(revoke|unrevoke|suspend|unsuspend|clearflag|resetseat)$/.test(action)) return res.status(400).type('text/plain').send('bad action');
+  let ok = false;
+  try { ks.mutate((db) => { ok = _adminAct(db, key, action); }); } catch (e) { return res.status(503).type('text/plain').send('store write failed: ' + ((e && e.message) || e)); }
+  try { if (ok) ks.audit('admin-panel', key, action); } catch {}
+  res.redirect(303, '/admin');
 });
 
 const PORT = process.env.PORT || 3509;
