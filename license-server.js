@@ -526,6 +526,20 @@ function adminBasic(req, res, next) {
 }
 function _escH(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 function _ago(ms) { if (!ms) return '—'; const s = Math.max(0, Math.floor((Date.now() - Number(ms)) / 1000)); if (s < 60) return s + 's'; if (s < 3600) return Math.floor(s / 60) + 'm'; if (s < 86400) return Math.floor(s / 3600) + 'h'; return Math.floor(s / 86400) + 'd'; }
+// ★2026-09-02 (operator: "I can't see app1/app2 version data"): the panel row SUMS every brand-app under one key (one
+// pro key covers app0/1/2 on a machine), so the per-app split was invisible. Map the reported brand → a friendly label
+// and render a per-app breakdown sub-row (each app's ver · accounts · groups · last-seen) so the operator can see which
+// apps a customer has actually launched and what version each is on. Data source: rec.apps (recordAppTelemetry, per-brand).
+const _APP_LABEL = { 'za-post-restored': 'App 0', 'za-app-1': 'App 1', 'za-app-2': 'App 2', 'za-app-3': 'App 3' };
+const _APP_RANK = { 'za-post-restored': 0, 'za-app-1': 1, 'za-app-2': 2, 'za-app-3': 3 };
+function _appLabel(b) { return _APP_LABEL[b] || String(b || '?'); }
+function _appsBreakdown(r) {
+  const apps = (r && r.apps && typeof r.apps === 'object') ? r.apps : null;
+  if (!apps) return '';
+  const bs = Object.keys(apps).sort((a, b) => (_APP_RANK[a] != null ? _APP_RANK[a] : 9) - (_APP_RANK[b] != null ? _APP_RANK[b] : 9) || a.localeCompare(b));
+  if (!bs.length) return '';
+  return bs.map((b) => { const a = apps[b] || {}; return '<span class="app"><b>' + _escH(_appLabel(b)) + '</b> ' + _escH(a.ver || '?') + ' · ' + (Number(a.acc) || 0) + 'a · ' + (Number(a.grp) || 0) + 'g · ' + _ago(a.at) + '</span>'; }).join('<span class="sep"> | </span>');
+}
 function renderAdminHtml(db, token) {
   const now = Date.now();
   const keys = Object.keys(db || {}).sort((a, b) => String((db[a] && db[a].note) || '').localeCompare(String((db[b] && db[b].note) || '')));
@@ -549,14 +563,20 @@ function renderAdminHtml(db, token) {
       : (af('revoke', 'revoke', 'b-danger') + (r.suspended ? af('unsuspend', 'lift', 'b-ok') : af('suspend', 'suspend', 'b-warn')));
     if (r.hwid) acts += af('unbind', 'unbind', 'b-warn');
     if (fl) acts += (r.flagged.reason === 'seat-mismatch') ? af('resetseat', 'reset seat', 'b-flat') : af('clearflag', 'clear flag', 'b-flat');
-    return '<tr class="s-' + status + (fl ? ' fl' : '') + '">'
+    const appsHtml = _appsBreakdown(r);
+    const nApps = (r && r.apps && typeof r.apps === 'object') ? Object.keys(r.apps).length : 0;
+    const mainRow = '<tr class="s-' + status + (fl ? ' fl' : '') + (appsHtml ? ' hasapps' : '') + '">'
       + '<td>' + _escH(r.note || '—') + '</td><td class="dim">' + _escH(r.seatClient || '—') + '</td>'
       + '<td><code>' + _escH(mask) + '</code></td><td>' + _escH(r.tier || 'std') + '</td>'
       + '<td class="st">' + status + '</td><td>' + (r.hwid ? '<code>' + _escH(String(r.hwid).slice(0, 8)) + '…</code>' : '<span class="dim">unbound</span>') + '</td>'
-      + '<td>' + _ago(r.lastSeen) + '</td><td>' + _escH(r.lastVersion || '?') + '</td>'
+      + '<td>' + _ago(r.lastSeen) + '</td><td>' + _escH(r.lastVersion || '?') + (nApps > 1 ? ' <span class="dim">×' + nApps + '</span>' : '') + '</td>'
       + '<td class="num">' + (Number(t.acc) || 0) + '</td><td class="num">' + (Number(t.grp) || 0) + '</td>'
       + '<td class="num">' + (ip24 || '') + '</td><td class="fl">' + flTxt + '</td>'
       + '<td class="act">' + acts + '</td></tr>';
+    // Per-app breakdown sub-row (full-width) — shows each launched brand-app's ver/acc/grp/seen so the operator can
+    // tell app0/app1/app2 apart and see which the customer has actually turned on. Only when ≥1 app reported a brand.
+    const subRow = appsHtml ? '<tr class="apps s-' + status + '"><td class="dim">apps</td><td colspan="12">' + appsHtml + '</td></tr>' : '';
+    return mainRow + subRow;
   }).join('');
   return '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
     + '<meta http-equiv="refresh" content="45"><title>za-post · licenses</title><style>'
@@ -567,6 +587,7 @@ function renderAdminHtml(db, token) {
     + 'td.st{text-transform:uppercase;font-size:11px}tr.s-active td.st{color:#4ade80}tr.s-revoked td.st{color:#f87171}tr.s-suspended td.st{color:#fbbf24}tr.s-expired td.st{color:#8b95a1}'
     + 'td.fl{color:#fbbf24}.num{text-align:right;font-variant-numeric:tabular-nums}.dim{color:#8b95a1}code{color:#93c5fd;font:12px ui-monospace,Consolas,monospace}'
     + '.af{display:inline;margin:0 3px 0 0}td.act{white-space:nowrap}td.act button{font:11px inherit;padding:2px 7px;border:1px solid #2a3346;border-radius:4px;background:#1a2130;color:#d7dde3;cursor:pointer}td.act button:hover{background:#232c3d}.b-danger{border-color:#5a2020;color:#f87171}.b-warn{border-color:#5a4520;color:#fbbf24}.b-ok{border-color:#20502f;color:#4ade80}.b-flat{color:#93c5fd}'
+    + 'tr.hasapps td{border-bottom:none}tr.apps td{padding-top:2px;padding-bottom:8px;font-size:11.5px;color:#8b95a1}tr.apps .app b{color:#c4ccd6;font-weight:600}tr.apps .app{color:#9aa4b1}tr.apps .sep{color:#3a4151;padding:0 2px}'
     + '</style></head><body><h1>za-post · license control panel</h1><div class="sub">'
     + keys.length + ' keys · ' + active + ' active · ' + suspended + ' suspended · ' + revoked + ' revoked · ' + flagged + ' ⚠ flagged · Σ ' + totAcc + ' accounts / ' + totGrp + ' groups · '
     + _escH(new Date(now).toISOString().replace('T', ' ').slice(0, 19)) + ' UTC · auto-refresh 45s</div>'
