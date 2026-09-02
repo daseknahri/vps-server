@@ -554,7 +554,7 @@ function renderAdminHtml(db, token) {
     const t = ks.sumAppTelemetry ? ks.sumAppTelemetry(r) : { acc: r.lastAccounts || 0, grp: r.lastGroups || 0, apps: 0 };
     totAcc += Number(t.acc) || 0; totGrp += Number(t.grp) || 0;
     const mask = k.length > 9 ? (k.slice(0, 4) + '…' + k.slice(-4)) : k;
-    const flTxt = fl ? (r.flagged.reason === 'seat-mismatch' ? ('seat≠' + _escH(r.flagged.got || '')) : (r.flagged.reason + (r.flagged.ips ? ' ' + r.flagged.ips + 'ip' : r.flagged.hwids ? ' ' + r.flagged.hwids + 'hw' : ''))) : '';
+    const flTxt = fl ? (r.flagged.reason === 'seat-mismatch' ? ('seat≠' + _escH(r.flagged.got || '')) : (_escH(r.flagged.reason) + (r.flagged.ips ? ' ' + _escH(r.flagged.ips) + 'ip' : r.flagged.hwids ? ' ' + _escH(r.flagged.hwids) + 'hw' : ''))) : ''; // ★2026-09-02 audit M2: _escH the reason + counts for consistency/defense-in-depth (all current values are safe literals/numbers, but every sibling field is escaped)
     const ip24 = Array.isArray(r.ipLog) ? r.ipLog.filter((e) => e && now - Number(e.ts) <= 86400000).length : 0;
     // Per-row action FORMS (POST /admin/act). Each carries the ADMIN_TOKEN in a hidden field — the CSRF defense: a cross-origin
     // attacker can't read this authed page, so it can't forge the token even if the browser auto-sends the Basic creds.
@@ -587,7 +587,7 @@ function renderAdminHtml(db, token) {
     + 'td.st{text-transform:uppercase;font-size:11px}tr.s-active td.st{color:#4ade80}tr.s-revoked td.st{color:#f87171}tr.s-suspended td.st{color:#fbbf24}tr.s-expired td.st{color:#8b95a1}'
     + 'td.fl{color:#fbbf24}.num{text-align:right;font-variant-numeric:tabular-nums}.dim{color:#8b95a1}code{color:#93c5fd;font:12px ui-monospace,Consolas,monospace}'
     + '.af{display:inline;margin:0 3px 0 0}td.act{white-space:nowrap}td.act button{font:11px inherit;padding:2px 7px;border:1px solid #2a3346;border-radius:4px;background:#1a2130;color:#d7dde3;cursor:pointer}td.act button:hover{background:#232c3d}.b-danger{border-color:#5a2020;color:#f87171}.b-warn{border-color:#5a4520;color:#fbbf24}.b-ok{border-color:#20502f;color:#4ade80}.b-flat{color:#93c5fd}'
-    + 'tr.hasapps td{border-bottom:none}tr.apps td{padding-top:2px;padding-bottom:8px;font-size:11.5px;color:#8b95a1}tr.apps .app b{color:#c4ccd6;font-weight:600}tr.apps .app{color:#9aa4b1}tr.apps .sep{color:#3a4151;padding:0 2px}'
+    + 'tr.hasapps td{border-bottom:none}tr.apps td{padding-top:2px;padding-bottom:8px;font-size:11.5px;color:#8b95a1;white-space:normal;overflow-wrap:anywhere}tr.apps .app b{color:#c4ccd6;font-weight:600}tr.apps .app{color:#9aa4b1;white-space:nowrap}tr.apps .sep{color:#3a4151;padding:0 2px}'
     + '</style></head><body><h1>za-post · license control panel</h1><div class="sub">'
     + keys.length + ' keys · ' + active + ' active · ' + suspended + ' suspended · ' + revoked + ' revoked · ' + flagged + ' ⚠ flagged · Σ ' + totAcc + ' accounts / ' + totGrp + ' groups · '
     + _escH(new Date(now).toISOString().replace('T', ' ').slice(0, 19)) + ' UTC · auto-refresh 45s</div>'
